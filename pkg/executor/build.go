@@ -18,6 +18,7 @@ package executor
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -758,6 +759,17 @@ func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
 			log.Println("*** _Cmd", _Cmd)
 			log.Println("*** _Entrypoint", _Entrypoint)
 			log.Println("*** _Shell", _Shell)
+			resultsJSON := os.Getenv("results_json")
+
+			configContent, err := json.Marshal(sb.cf.Config)
+			if err != nil {
+				fmt.Println(err)
+				return nil, err
+			}
+
+			ioutil.WriteFile(resultsJSON, configContent, 0600)
+
+			log.Println("*** results_json", resultsJSON)
 
 			sourceImage, err = mutate.CreatedAt(sourceImage, v1.Time{Time: time.Now()})
 			if err != nil {
