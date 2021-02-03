@@ -1,0 +1,1 @@
+docker build -f deploy/Dockerfile . -t rounak316/kaniko_test
