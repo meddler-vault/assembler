@@ -17,7 +17,10 @@ limitations under the License.
 package executor
 
 import (
+	"bufio"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -554,11 +557,128 @@ func CalculateDependencies(stages []config.KanikoStage, opts *config.KanikoOptio
 	return depGraph, nil
 }
 
+func AddPreStage(opts *config.KanikoOptions) error {
+
+	dockerFilePath := opts.DockerfilePath
+	log.Println("Adding PreStage: dockerFilePath", dockerFilePath)
+
+	err := NewRecord(dockerFilePath).Prepend(`
+	FROM rounak316/watchdog:0.0.1 as builder_d
+	`)
+
+	if err != nil {
+		log.Println("failed to prepend: %+v", err)
+		return err
+
+	}
+
+	err = NewRecord(dockerFilePath).Append(`
+	ENV message_queue_topic=tasks_test
+	COPY --from=builder_d /go/src/github.com/meddler-io/watchdog/watchdog.bin  /kaniko/watchdog
+	ENTRYPOINT [ "/kaniko/watchdog" ]
+	`)
+
+	if err != nil {
+		log.Fatalf("failed to append: %+v", err)
+		return err
+	}
+
+	fileContent, err := ioutil.ReadFile(dockerFilePath)
+	log.Println("File Content")
+	log.Println(string(fileContent))
+	return err
+}
+
+type Record struct {
+	Filename string
+	Contents []string
+}
+
+func NewRecord(filename string) *Record {
+	return &Record{
+		Filename: filename,
+		Contents: make([]string, 0),
+	}
+}
+
+func (r *Record) readLines() error {
+	if _, err := os.Stat(r.Filename); err != nil {
+		return nil
+	}
+
+	f, err := os.OpenFile(r.Filename, os.O_RDONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		if tmp := scanner.Text(); len(tmp) != 0 {
+			r.Contents = append(r.Contents, tmp)
+		}
+	}
+
+	return nil
+}
+
+func (r *Record) Prepend(content string) error {
+	err := r.readLines()
+	if err != nil {
+		return err
+	}
+
+	f, err := os.OpenFile(r.Filename, os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	writer := bufio.NewWriter(f)
+	writer.WriteString(fmt.Sprintf("%s\n", content))
+	for _, line := range r.Contents {
+		_, err := writer.WriteString(fmt.Sprintf("%s\n", line))
+		if err != nil {
+			return err
+		}
+	}
+
+	if err := writer.Flush(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *Record) Append(content string) error {
+
+	f, err := os.OpenFile(r.Filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	if err != nil {
+		return err
+
+	}
+
+	defer f.Close()
+
+	if _, err = f.WriteString(content); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // DoBuild executes building the Dockerfile
 func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
+
 	t := timing.Start("Total Build Time")
 	digestToCacheKey := make(map[string]string)
 	stageIdxToDigest := make(map[string]string)
+
+	err := AddPreStage(opts)
+
+	if err != nil {
+		return nil, err
+	}
 
 	stages, metaArgs, err := dockerfile.ParseStages(opts)
 	if err != nil {
@@ -630,6 +750,15 @@ func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
 		logrus.Debugf("mapping digest %v to cachekey %v", d.String(), sb.finalCacheKey)
 
 		if stage.Final {
+
+			_Cmd := sb.cf.Config.Cmd
+			_Entrypoint := sb.cf.Config.Entrypoint
+			_Shell := sb.cf.Config.Shell
+
+			log.Println("*** _Cmd", _Cmd)
+			log.Println("*** _Entrypoint", _Entrypoint)
+			log.Println("*** _Shell", _Shell)
+
 			sourceImage, err = mutate.CreatedAt(sourceImage, v1.Time{Time: time.Now()})
 			if err != nil {
 				return nil, err
