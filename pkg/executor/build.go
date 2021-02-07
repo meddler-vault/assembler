@@ -573,10 +573,11 @@ func AddPreStage(opts *config.KanikoOptions) error {
 
 	}
 
+	// TODO: Add customizable binarypath
 	err = NewRecord(dockerFilePath).Append(`
 	ENV message_queue_topic=tasks_test
-	COPY --from=builder_d /go/src/github.com/meddler-io/watchdog/watchdog.bin  /kaniko/watchdog
-	ENTRYPOINT [ "/kaniko/watchdog" ]
+	COPY --from=builder_d /go/src/github.com/meddler-io/watchdog/watchdog.bin  /bin/watchdog
+	ENTRYPOINT [ "/bin/watchdog" ]
 	`)
 
 	if err != nil {
