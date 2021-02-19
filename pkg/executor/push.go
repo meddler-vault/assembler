@@ -111,6 +111,7 @@ func CheckPushPermissions(opts *config.KanikoOptions) error {
 
 	checked := map[string]bool{}
 	_, err := fs.Stat(DockerConfLocation())
+	print("Docker ConfigPath", DockerConfLocation())
 	dockerConfNotExists := os.IsNotExist(err)
 	for _, destination := range targets {
 		destRef, err := name.NewTag(destination, name.WeakValidation)
