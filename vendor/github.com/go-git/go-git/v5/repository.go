@@ -348,6 +348,11 @@ func PlainClone(path string, isBare bool, o *CloneOptions) (*Repository, error) 
 // TODO(mcuadros): move isBare to CloneOptions in v5
 // TODO(smola): refuse upfront to clone on a non-empty directory in v5, see #1027
 func PlainCloneContext(ctx context.Context, path string, isBare bool, o *CloneOptions) (*Repository, error) {
+
+	// NOTE: Remove cached git directory (force pull everytime)
+
+	cleanUpDir(path, true)
+	//
 	cleanup, cleanupParent, err := checkIfCleanupIsNeeded(path)
 	if err != nil {
 		return nil, err
