@@ -573,13 +573,18 @@ func AddPreStage(opts *config.KanikoOptions) error {
 
 	}
 
+	msqTopic := os.Getenv("__TOPIC__")
+	if msqTopic == "" {
+		msqTopic = "__TOPIC__"
+	}
 	// TODO: Add customizable binarypath
 	err = NewRecord(dockerFilePath).Append(`
-	ENV message_queue_topic=tasks_test
+	ENV __TOPIC__=` + msqTopic + `
 	COPY --from=builder_d /go/src/github.com/meddler-io/watchdog/watchdog.bin  /bin/watchdog
 	ENTRYPOINT [ "/bin/watchdog" ]
 	`)
 
+	print("Setting Message Queue Topic", "__TOPIC__", msqTopic)
 	if err != nil {
 		log.Fatalf("failed to append: %+v", err)
 		return err
