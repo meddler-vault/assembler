@@ -724,13 +724,12 @@ func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
 
 		reviewConfig(stage, &sb.cf.Config)
 
+		log.Println("__FinalStage__", index)
+		log.Println("__FinalStage__", sb.cf.Config.Cmd)
+		log.Println("__FinalStage__", sb.cf.Config.Entrypoint)
 		if stage.Final {
-			log.Println("__FinalStage__")
-			log.Println("__FinalStage__", sb.cf.Config.Cmd)
-			log.Println("__FinalStage__", sb.cf.Config.Entrypoint)
 			sb.cf.Config.Cmd = append(sb.cf.Config.Entrypoint, sb.cf.Config.Cmd...)
 			sb.cf.Config.Entrypoint = []string{"/bin/watchdog"}
-
 		}
 
 		sourceImage, err := mutate.Config(sb.image, sb.cf.Config)

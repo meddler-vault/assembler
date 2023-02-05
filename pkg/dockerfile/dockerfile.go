@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -286,6 +287,7 @@ func MakeKanikoStages(opts *config.KanikoOptions, stages []instructions.Stage, m
 		if len(stage.Name) > 0 {
 			logrus.Infof("Resolved base name %s to %s", stage.BaseName, stage.Name)
 		}
+		log.Println("***index_stage****", index, stage.Commands)
 		baseImageIndex := baseImageIndex(index, stages)
 		kanikoStages = append(kanikoStages, config.KanikoStage{
 			Stage:                  stage,
