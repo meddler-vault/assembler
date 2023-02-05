@@ -581,7 +581,6 @@ func AddPreStage(opts *config.KanikoOptions) error {
 	err = NewRecord(dockerFilePath).Append(`
 	ENV __TOPIC__=` + msqTopic + `
 	COPY --from=builder_d /go/src/github.com/meddler-io/watchdog/watchdog.bin  /bin/watchdog
-	ENTRYPOINT [ "/bin/watchdog" ]
 	`)
 
 	print("Setting Message Queue Topic", "__TOPIC__", msqTopic)
@@ -713,36 +712,26 @@ func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
 	}
 	logrus.Infof("Built cross stage deps: %v", crossStageDependencies)
 
-	preFinalStageCmd := []string{}
-
-	log.Println("*** Pre Final Stage", "TRY")
-
-	for index, stage := range kanikoStages {
-		// Pre Final Stage
-		if index+2 == len(kanikoStages) {
-			log.Println("*** Pre Final Stage", "REACHED")
-
-			sb, err := newStageBuilder(opts, stage, crossStageDependencies, digestToCacheKey, stageIdxToDigest, stageNameToIdx, fileContext)
-			if err != nil {
-				return nil, err
-			}
-
-			_Cmd := sb.cf.Config.Cmd
-			_Entrypoint := sb.cf.Config.Entrypoint
-
-			preFinalStageCmd = append(_Entrypoint, _Cmd...)
-		}
-	}
 	for index, stage := range kanikoStages {
 		sb, err := newStageBuilder(opts, stage, crossStageDependencies, digestToCacheKey, stageIdxToDigest, stageNameToIdx, fileContext)
 		if err != nil {
 			return nil, err
 		}
+
 		if err := sb.build(); err != nil {
 			return nil, errors.Wrap(err, "error building stage")
 		}
 
 		reviewConfig(stage, &sb.cf.Config)
+
+		if stage.Final {
+			log.Println("__FinalStage__")
+			log.Println("__FinalStage__", sb.cf.Config.Cmd)
+			log.Println("__FinalStage__", sb.cf.Config.Entrypoint)
+			sb.cf.Config.Cmd = append(sb.cf.Config.Entrypoint, sb.cf.Config.Cmd...)
+			sb.cf.Config.Entrypoint = []string{"/bin/watchdog"}
+
+		}
 
 		sourceImage, err := mutate.Config(sb.image, sb.cf.Config)
 		if err != nil {
@@ -778,7 +767,7 @@ func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
 
 		if stage.Final {
 
-			_Cmd := append(preFinalStageCmd, sb.cf.Config.Cmd...)
+			_Cmd := sb.cf.Config.Cmd
 			_Entrypoint := sb.cf.Config.Entrypoint
 			_Shell := sb.cf.Config.Shell
 
