@@ -564,7 +564,7 @@ func AddPreStage(opts *config.KanikoOptions) error {
 	log.Println("Adding PreStage: dockerFilePath", dockerFilePath)
 
 	err := NewRecord(dockerFilePath).Prepend(`
-	FROM rounak316/watchdog:0.0.1 as builder_d
+	FROM rounak316/watchdog:latest as builder_d
 	`)
 
 	if err != nil {
@@ -713,6 +713,7 @@ func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
 	}
 	logrus.Infof("Built cross stage deps: %v", crossStageDependencies)
 
+	preFinalStageCmd := []string{}
 	for index, stage := range kanikoStages {
 		sb, err := newStageBuilder(opts, stage, crossStageDependencies, digestToCacheKey, stageIdxToDigest, stageNameToIdx, fileContext)
 		if err != nil {
@@ -756,9 +757,17 @@ func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
 		digestToCacheKey[d.String()] = sb.finalCacheKey
 		logrus.Debugf("mapping digest %v to cachekey %v", d.String(), sb.finalCacheKey)
 
+		// Pre Final Stage
+		if index+2 == len(stages) {
+			_Cmd := sb.cf.Config.Cmd
+			_Entrypoint := sb.cf.Config.Entrypoint
+
+			preFinalStageCmd = append(_Entrypoint, _Cmd...)
+		}
+
 		if stage.Final {
 
-			_Cmd := sb.cf.Config.Cmd
+			_Cmd := append(preFinalStageCmd, sb.cf.Config.Cmd...)
 			_Entrypoint := sb.cf.Config.Entrypoint
 			_Shell := sb.cf.Config.Shell
 
