@@ -22,12 +22,17 @@ import (
 	"encoding/hex"
 	"io"
 	"io/ioutil"
+	"math"
 	"os"
 	"strconv"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/minio/highwayhash"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 // Hasher returns a hash function, used in snapshotting to determine if a file has changed
@@ -53,6 +58,10 @@ func Hasher() func(string) (string, error) {
 		h.Write([]byte(strconv.FormatUint(uint64(fi.Sys().(*syscall.Stat_t).Gid), 36)))
 
 		if fi.Mode().IsRegular() {
+			capability, _ := Lgetxattr(p, "security.capability")
+			if capability != nil {
+				h.Write(capability)
+			}
 			f, err := os.Open(p)
 			if err != nil {
 				return "", err
@@ -63,6 +72,12 @@ func Hasher() func(string) (string, error) {
 			if _, err := io.CopyBuffer(h, f, *buf); err != nil {
 				return "", err
 			}
+		} else if fi.Mode()&os.ModeSymlink == os.ModeSymlink {
+			linkPath, err := os.Readlink(p)
+			if err != nil {
+				return "", err
+			}
+			h.Write([]byte(linkPath))
 		}
 
 		return hex.EncodeToString(h.Sum(nil)), nil
@@ -93,6 +108,12 @@ func CacheHasher() func(string) (string, error) {
 			if _, err := io.Copy(h, f); err != nil {
 				return "", err
 			}
+		} else if fi.Mode()&os.ModeSymlink == os.ModeSymlink {
+			linkPath, err := os.Readlink(p)
+			if err != nil {
+				return "", err
+			}
+			h.Write([]byte(linkPath))
 		}
 
 		return hex.EncodeToString(h.Sum(nil)), nil
@@ -153,4 +174,44 @@ func GetInputFrom(r io.Reader) ([]byte, error) {
 		return nil, err
 	}
 	return output, nil
+}
+
+type retryFunc func() error
+
+// Retry retries an operation
+func Retry(operation retryFunc, retryCount int, initialDelayMilliseconds int) error {
+	err := operation()
+	for i := 0; err != nil && i < retryCount; i++ {
+		sleepDuration := time.Millisecond * time.Duration(int(math.Pow(2, float64(i)))*initialDelayMilliseconds)
+		logrus.Warnf("Retrying operation after %s due to %v", sleepDuration, err)
+		time.Sleep(sleepDuration)
+		err = operation()
+	}
+
+	return err
+}
+
+func Lgetxattr(path string, attr string) ([]byte, error) {
+	// Start with a 128 length byte array
+	dest := make([]byte, 128)
+	sz, errno := unix.Lgetxattr(path, attr, dest)
+
+	for errors.Is(errno, unix.ERANGE) {
+		// Buffer too small, use zero-sized buffer to get the actual size
+		sz, errno = unix.Lgetxattr(path, attr, []byte{})
+		if errno != nil {
+			return nil, errno
+		}
+		dest = make([]byte, sz)
+		sz, errno = unix.Lgetxattr(path, attr, dest)
+	}
+
+	switch {
+	case errors.Is(errno, unix.ENODATA):
+		return nil, nil
+	case errno != nil:
+		return nil, errno
+	}
+
+	return dest[:sz], nil
 }

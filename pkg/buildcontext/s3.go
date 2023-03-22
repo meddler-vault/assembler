@@ -17,12 +17,15 @@ limitations under the License.
 package buildcontext
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
+	kConfig "github.com/GoogleContainerTools/kaniko/pkg/config"
 	"github.com/GoogleContainerTools/kaniko/pkg/constants"
 	"github.com/GoogleContainerTools/kaniko/pkg/util"
+	"github.com/GoogleContainerTools/kaniko/pkg/util/bucket"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
@@ -36,7 +39,11 @@ type S3 struct {
 
 // UnpackTarFromBuildContext download and untar a file from s3
 func (s *S3) UnpackTarFromBuildContext() (string, error) {
-	bucket, item := util.GetBucketAndItem(s.context)
+	bucket, item, err := bucket.GetNameAndFilepathFromURI(s.context)
+	if err != nil {
+		return "", fmt.Errorf("getting bucketname and filepath from context: %w", err)
+	}
+
 	option := session.Options{
 		SharedConfigState: session.SharedConfigEnable,
 	}
@@ -56,7 +63,7 @@ func (s *S3) UnpackTarFromBuildContext() (string, error) {
 		return bucket, err
 	}
 	downloader := s3manager.NewDownloader(sess)
-	directory := constants.BuildContextDir
+	directory := kConfig.BuildContextDir
 	tarPath := filepath.Join(directory, constants.ContextTar)
 	if err := os.MkdirAll(directory, 0750); err != nil {
 		return directory, err

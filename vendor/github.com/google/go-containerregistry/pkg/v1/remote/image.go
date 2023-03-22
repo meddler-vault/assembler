@@ -15,16 +15,16 @@
 package remote
 
 import (
+	"bytes"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"sync"
 
-	"github.com/google/go-containerregistry/pkg/internal/redact"
+	"github.com/google/go-containerregistry/internal/redact"
+	"github.com/google/go-containerregistry/internal/verify"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
-	"github.com/google/go-containerregistry/pkg/v1/internal/verify"
 	"github.com/google/go-containerregistry/pkg/v1/partial"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/google/go-containerregistry/pkg/v1/types"
@@ -44,6 +44,15 @@ type remoteImage struct {
 	config       []byte
 	mediaType    types.MediaType
 	descriptor   *v1.Descriptor
+}
+
+func (r *remoteImage) ArtifactType() (string, error) {
+	// kind of a hack, but RawManifest does appropriate locking/memoization
+	// and makes sure r.descriptor is populated.
+	if _, err := r.RawManifest(); err != nil {
+		return "", err
+	}
+	return r.descriptor.ArtifactType, nil
 }
 
 var _ partial.CompressedImageCore = (*remoteImage)(nil)
@@ -100,13 +109,21 @@ func (r *remoteImage) RawConfigFile() ([]byte, error) {
 		return nil, err
 	}
 
-	body, err := r.fetchBlob(r.context, m.Config.Digest)
+	if m.Config.Data != nil {
+		if err := verify.Descriptor(m.Config); err != nil {
+			return nil, err
+		}
+		r.config = m.Config.Data
+		return r.config, nil
+	}
+
+	body, err := r.fetchBlob(r.context, m.Config.Size, m.Config.Digest)
 	if err != nil {
 		return nil, err
 	}
 	defer body.Close()
 
-	r.config, err = ioutil.ReadAll(body)
+	r.config, err = io.ReadAll(body)
 	if err != nil {
 		return nil, err
 	}
@@ -143,6 +160,10 @@ func (rl *remoteImageLayer) Compressed() (io.ReadCloser, error) {
 		return nil, err
 	}
 
+	if d.Data != nil {
+		return verify.ReadCloser(io.NopCloser(bytes.NewReader(d.Data)), d.Size, d.Digest)
+	}
+
 	// We don't want to log binary layers -- this can break terminals.
 	ctx := redact.NewContext(rl.ri.context, "omitting binary blobs from logs")
 
@@ -177,7 +198,7 @@ func (rl *remoteImageLayer) Compressed() (io.ReadCloser, error) {
 			continue
 		}
 
-		return verify.ReadCloser(resp.Body, rl.digest)
+		return verify.ReadCloser(resp.Body, d.Size, rl.digest)
 	}
 
 	return nil, lastErr
@@ -219,6 +240,11 @@ func (rl *remoteImageLayer) DiffID() (v1.Hash, error) {
 // See partial.Descriptor.
 func (rl *remoteImageLayer) Descriptor() (*v1.Descriptor, error) {
 	return partial.BlobDescriptor(rl, rl.digest)
+}
+
+// See partial.Exists.
+func (rl *remoteImageLayer) Exists() (bool, error) {
+	return rl.ri.blobExists(rl.digest)
 }
 
 // LayerByDigest implements partial.CompressedLayer

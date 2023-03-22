@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -58,13 +59,14 @@ const emptyTarSize = 1024
 // for testing
 var (
 	initializeConfig = initConfig
+	getFSFromImage   = util.GetFSFromImage
 )
 
 type cachePusher func(*config.KanikoOptions, string, string, string) error
 type snapShotter interface {
 	Init() error
 	TakeSnapshotFS() (string, error)
-	TakeSnapshot([]string, bool) (string, error)
+	TakeSnapshot([]string, bool, bool) (string, error)
 }
 
 // stageBuilder contains all fields necessary to build one stage of a Dockerfile
@@ -87,7 +89,7 @@ type stageBuilder struct {
 }
 
 // newStageBuilder returns a new type stageBuilder which contains all the information required to build the stage
-func newStageBuilder(opts *config.KanikoOptions, stage config.KanikoStage, crossStageDeps map[int][]string, dcm map[string]string, sid map[string]string, stageNameToIdx map[string]string, fileContext util.FileContext) (*stageBuilder, error) {
+func newStageBuilder(args *dockerfile.BuildArgs, opts *config.KanikoOptions, stage config.KanikoStage, crossStageDeps map[int][]string, dcm map[string]string, sid map[string]string, stageNameToIdx map[string]string, fileContext util.FileContext) (*stageBuilder, error) {
 	sourceImage, err := image_util.RetrieveSourceImage(stage, opts)
 	if err != nil {
 		return nil, err
@@ -102,11 +104,16 @@ func newStageBuilder(opts *config.KanikoOptions, stage config.KanikoStage, cross
 		return nil, err
 	}
 
+	err = util.InitIgnoreList(true)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to initialize ignore list")
+	}
+
 	hasher, err := getHasher(opts.SnapshotMode)
 	if err != nil {
 		return nil, err
 	}
-	l := snapshot.NewLayeredMap(hasher, util.CacheHasher())
+	l := snapshot.NewLayeredMap(hasher)
 	snapshotter := snapshot.NewSnapshotter(l, config.RootDir)
 
 	digest, err := sourceImage.Digest()
@@ -124,14 +131,12 @@ func newStageBuilder(opts *config.KanikoOptions, stage config.KanikoStage, cross
 		crossStageDeps:   crossStageDeps,
 		digestToCacheKey: dcm,
 		stageIdxToDigest: sid,
-		layerCache: &cache.RegistryCache{
-			Opts: opts,
-		},
+		layerCache:       newLayerCache(opts),
 		pushLayerToCache: pushLayerToCache,
 	}
 
 	for _, cmd := range s.stage.Commands {
-		command, err := commands.GetCommand(cmd, fileContext, opts.RunV2, opts.CacheCopyLayers)
+		command, err := commands.GetCommand(cmd, fileContext, opts.RunV2, opts.CacheCopyLayers, opts.CacheRunLayers)
 		if err != nil {
 			return nil, err
 		}
@@ -141,7 +146,11 @@ func newStageBuilder(opts *config.KanikoOptions, stage config.KanikoStage, cross
 		s.cmds = append(s.cmds, command)
 	}
 
-	s.args = dockerfile.NewBuildArgs(s.opts.BuildArgs)
+	if args != nil {
+		s.args = args.Clone()
+	} else {
+		s.args = dockerfile.NewBuildArgs(s.opts.BuildArgs)
+	}
 	s.args.AddMetaArgs(s.stage.MetaArgs)
 	return s, nil
 }
@@ -177,19 +186,43 @@ func initConfig(img partial.WithConfigFile, opts *config.KanikoOptions) (*v1.Con
 	return imageConfig, nil
 }
 
+func newLayerCache(opts *config.KanikoOptions) cache.LayerCache {
+	if isOCILayout(opts.CacheRepo) {
+		return &cache.LayoutCache{
+			Opts: opts,
+		}
+	}
+	return &cache.RegistryCache{
+		Opts: opts,
+	}
+}
+
+func isOCILayout(path string) bool {
+	return strings.HasPrefix(path, "oci:")
+}
+
 func (s *stageBuilder) populateCompositeKey(command fmt.Stringer, files []string, compositeKey CompositeCache, args *dockerfile.BuildArgs, env []string) (CompositeCache, error) {
 	// First replace all the environment variables or args in the command
 	replacementEnvs := args.ReplacementEnvs(env)
+	// The sort order of `replacementEnvs` is basically undefined, sort it
+	// so we can ensure a stable cache key.
+	sort.Strings(replacementEnvs)
 	resolvedCmd, err := util.ResolveEnvironmentReplacement(command.String(), replacementEnvs, false)
 	if err != nil {
 		return compositeKey, err
 	}
+	// Use the special argument "|#" at the start of the args array. This will
+	// avoid conflicts with any RUN command since commands can not
+	// start with | (vertical bar). The "#" (number of build envs) is there to
+	// help ensure proper cache matches.
+	if len(replacementEnvs) > 0 {
+		compositeKey.AddKey(fmt.Sprintf("|%d", len(replacementEnvs)))
+		compositeKey.AddKey(replacementEnvs...)
+	}
 	// Add the next command to the cache key.
 	compositeKey.AddKey(resolvedCmd)
-	switch v := command.(type) {
-	case *commands.CopyCommand:
-	case *commands.CachingCopyCommand:
-		compositeKey = s.populateCopyCmdCompositeKey(command, v.From(), compositeKey)
+	if copyCmd, ok := commands.CastAbstractCopyCommand(command); ok == true {
+		compositeKey = s.populateCopyCmdCompositeKey(command, copyCmd.From(), compositeKey)
 	}
 
 	for _, f := range files {
@@ -207,7 +240,7 @@ func (s *stageBuilder) populateCopyCmdCompositeKey(command fmt.Stringer, from st
 			ds := digest
 			cacheKey, ok := s.digestToCacheKey[ds]
 			if ok {
-				logrus.Debugf("adding digest %v from previous stage to composite key for %v", ds, command.String())
+				logrus.Debugf("Adding digest %v from previous stage to composite key for %v", ds, command.String())
 				compositeKey.AddKey(cacheKey)
 			}
 		}
@@ -220,6 +253,11 @@ func (s *stageBuilder) optimize(compositeKey CompositeCache, cfg v1.Config) erro
 	if !s.opts.Cache {
 		return nil
 	}
+	var buildArgs = s.args.Clone()
+	// Restore build args back to their original values
+	defer func() {
+		s.args = buildArgs
+	}()
 
 	stopCache := false
 	// Possibly replace commands with their cached implementations.
@@ -240,13 +278,13 @@ func (s *stageBuilder) optimize(compositeKey CompositeCache, cfg v1.Config) erro
 			return err
 		}
 
-		logrus.Debugf("optimize: composite key for command %v %v", command.String(), compositeKey)
+		logrus.Debugf("Optimize: composite key for command %v %v", command.String(), compositeKey)
 		ck, err := compositeKey.Hash()
 		if err != nil {
 			return errors.Wrap(err, "failed to hash composite key")
 		}
 
-		logrus.Debugf("optimize: cache key for command %v %v", command.String(), ck)
+		logrus.Debugf("Optimize: cache key for command %v %v", command.String(), ck)
 		s.finalCacheKey = ck
 
 		if command.ShouldCacheOutput() && !stopCache {
@@ -302,21 +340,25 @@ func (s *stageBuilder) build() error {
 	if len(s.crossStageDeps[s.stage.Index]) > 0 {
 		shouldUnpack = true
 	}
+	if s.stage.Index == 0 && s.opts.InitialFSUnpacked {
+		shouldUnpack = false
+	}
 
 	if shouldUnpack {
 		t := timing.Start("FS Unpacking")
 
-		if _, err := util.GetFSFromImage(config.RootDir, s.image, util.ExtractFile); err != nil {
+		retryFunc := func() error {
+			_, err := getFSFromImage(config.RootDir, s.image, util.ExtractFile)
+			return err
+		}
+
+		if err := util.Retry(retryFunc, s.opts.ImageFSExtractRetry, 1000); err != nil {
 			return errors.Wrap(err, "failed to get filesystem from image")
 		}
 
 		timing.DefaultRun.Stop(t)
 	} else {
 		logrus.Info("Skipping unpacking as no commands require it.")
-	}
-
-	if err := util.DetectFilesystemIgnoreList(config.IgnoreListPath); err != nil {
-		return errors.Wrap(err, "failed to check filesystem mount paths")
 	}
 
 	initSnapshotTaken := false
@@ -373,7 +415,8 @@ func (s *stageBuilder) build() error {
 		files = command.FilesToSnapshot()
 		timing.DefaultRun.Stop(t)
 
-		if !s.shouldTakeSnapshot(index, command.MetadataOnly()) {
+		if !s.shouldTakeSnapshot(index, command.MetadataOnly()) && !s.opts.ForceBuildMetadata {
+			logrus.Debugf("Build: skipping snapshot for [%v]", command.String())
 			continue
 		}
 		if isCacheCommand {
@@ -389,16 +432,16 @@ func (s *stageBuilder) build() error {
 			}
 
 			if s.opts.Cache {
-				logrus.Debugf("build: composite key for command %v %v", command.String(), compositeKey)
+				logrus.Debugf("Build: composite key for command %v %v", command.String(), compositeKey)
 				ck, err := compositeKey.Hash()
 				if err != nil {
 					return errors.Wrap(err, "failed to hash composite key")
 				}
 
-				logrus.Debugf("build: cache key for command %v %v", command.String(), ck)
+				logrus.Debugf("Build: cache key for command %v %v", command.String(), ck)
 
 				// Push layer to cache (in parallel) now along with new config file
-				if command.ShouldCacheOutput() {
+				if command.ShouldCacheOutput() && !s.opts.NoPushCache {
 					cacheGroup.Go(func() error {
 						return s.pushLayerToCache(s.opts, ck, tarPath, command.String())
 					})
@@ -411,7 +454,7 @@ func (s *stageBuilder) build() error {
 	}
 
 	if err := cacheGroup.Wait(); err != nil {
-		logrus.Warnf("error uploading layer to cache: %s", err)
+		logrus.Warnf("Error uploading layer to cache: %s", err)
 	}
 
 	return nil
@@ -427,7 +470,7 @@ func (s *stageBuilder) takeSnapshot(files []string, shdDelete bool) (string, err
 	} else {
 		// Volumes are very weird. They get snapshotted in the next command.
 		files = append(files, util.Volumes()...)
-		snapshot, err = s.snapshotter.TakeSnapshot(files, shdDelete)
+		snapshot, err = s.snapshotter.TakeSnapshot(files, shdDelete, s.opts.ForceBuildMetadata)
 	}
 	timing.DefaultRun.Stop(t)
 	return snapshot, err
@@ -471,12 +514,17 @@ func (s *stageBuilder) saveSnapshotToLayer(tarPath string) (v1.Layer, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "tar file path does not exist")
 	}
-	if fi.Size() <= emptyTarSize {
+	if fi.Size() <= emptyTarSize && !s.opts.ForceBuildMetadata {
 		logrus.Info("No files were changed, appending empty layer to config. No layer added to image.")
 		return nil, nil
 	}
 
-	layer, err := tarball.LayerFromFile(tarPath, tarball.WithCompressedCaching)
+	var layer v1.Layer
+	if s.opts.CompressedCaching == true {
+		layer, err = tarball.LayerFromFile(tarPath, tarball.WithCompressedCaching)
+	} else {
+		layer, err = tarball.LayerFromFile(tarPath)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -546,11 +594,13 @@ func CalculateDependencies(stages []config.KanikoStage, opts *config.KanikoOptio
 					return nil, err
 				}
 			case *instructions.ArgCommand:
-				k, v, err := commands.ParseArg(cmd.Key, cmd.Value, cfg.Config.Env, ba)
-				if err != nil {
-					return nil, err
+				for _, arg := range cmd.Args {
+					k, v, err := commands.ParseArg(arg.Key, arg.Value, cfg.Config.Env, ba)
+					if err != nil {
+						return nil, err
+					}
+					ba.AddArg(k, v)
 				}
-				ba.AddArg(k, v)
 			}
 		}
 		images = append(images, image)
@@ -712,12 +762,24 @@ func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
 	}
 	logrus.Infof("Built cross stage deps: %v", crossStageDependencies)
 
+	var args *dockerfile.BuildArgs
+
 	for index, stage := range kanikoStages {
-		sb, err := newStageBuilder(opts, stage, crossStageDependencies, digestToCacheKey, stageIdxToDigest, stageNameToIdx, fileContext)
+		sb, err := newStageBuilder(
+			args, opts, stage,
+			crossStageDependencies,
+			digestToCacheKey,
+			stageIdxToDigest,
+			stageNameToIdx,
+			fileContext)
+
+		logrus.Infof("Building stage '%v' [idx: '%v', base-idx: '%v']",
+			stage.BaseName, stage.Index, stage.BaseImageIndex)
+
 		if err != nil {
 			return nil, err
 		}
-
+		args = sb.args
 		if err := sb.build(); err != nil {
 			return nil, errors.Wrap(err, "error building stage")
 		}
@@ -759,10 +821,10 @@ func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
 		}
 
 		stageIdxToDigest[fmt.Sprintf("%d", sb.stage.Index)] = d.String()
-		logrus.Debugf("mapping stage idx %v to digest %v", sb.stage.Index, d.String())
+		logrus.Debugf("Mapping stage idx %v to digest %v", sb.stage.Index, d.String())
 
 		digestToCacheKey[d.String()] = sb.finalCacheKey
-		logrus.Debugf("mapping digest %v to cachekey %v", d.String(), sb.finalCacheKey)
+		logrus.Debugf("Mapping digest %v to cachekey %v", d.String(), sb.finalCacheKey)
 
 		if stage.Final {
 
@@ -934,7 +996,7 @@ func extractImageToDependencyDir(name string, image v1.Image) error {
 	if err := os.MkdirAll(dependencyDir, 0755); err != nil {
 		return err
 	}
-	logrus.Debugf("trying to extract to %s", dependencyDir)
+	logrus.Debugf("Trying to extract to %s", dependencyDir)
 	_, err := util.GetFSFromImage(dependencyDir, image, util.ExtractFile)
 	return err
 }
@@ -946,7 +1008,7 @@ func saveStageAsTarball(path string, image v1.Image) error {
 	if err != nil {
 		return err
 	}
-	tarPath := filepath.Join(constants.KanikoIntermediateStagesDir, path)
+	tarPath := filepath.Join(config.KanikoIntermediateStagesDir, path)
 	logrus.Infof("Storing source image from stage %s at path %s", path, tarPath)
 	if err := os.MkdirAll(filepath.Dir(tarPath), 0750); err != nil {
 		return err

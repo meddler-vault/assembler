@@ -34,6 +34,7 @@ import (
 	"github.com/GoogleContainerTools/kaniko/pkg/config"
 	"github.com/GoogleContainerTools/kaniko/pkg/timing"
 	"github.com/docker/docker/builder/dockerignore"
+	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/fileutils"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/karrick/godirwalk"
@@ -42,8 +43,10 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-const DoNotChangeUID = -1
-const DoNotChangeGID = -1
+const (
+	DoNotChangeUID = -1
+	DoNotChangeGID = -1
+)
 
 const (
 	snapshotTimeout = "SNAPSHOT_TIMEOUT_DURATION"
@@ -55,7 +58,7 @@ type IgnoreListEntry struct {
 	PrefixMatchOnly bool
 }
 
-var initialIgnoreList = []IgnoreListEntry{
+var defaultIgnoreList = []IgnoreListEntry{
 	{
 		Path:            config.KanikoDir,
 		PrefixMatchOnly: false,
@@ -74,7 +77,7 @@ var initialIgnoreList = []IgnoreListEntry{
 	},
 }
 
-var ignorelist = initialIgnoreList
+var ignorelist = append([]IgnoreListEntry{}, defaultIgnoreList...)
 
 var volumes = []string{}
 
@@ -98,6 +101,10 @@ func IgnoreList() []IgnoreListEntry {
 
 func AddToIgnoreList(entry IgnoreListEntry) {
 	ignorelist = append(ignorelist, entry)
+}
+
+func AddToDefaultIgnoreList(entry IgnoreListEntry) {
+	defaultIgnoreList = append(defaultIgnoreList, entry)
 }
 
 func IncludeWhiteout() FSOpt {
@@ -128,7 +135,12 @@ func GetFSFromImage(root string, img v1.Image, extract ExtractFunction) ([]strin
 }
 
 func GetFSFromLayers(root string, layers []v1.Layer, opts ...FSOpt) ([]string, error) {
+	volumes = []string{}
 	cfg := new(FSConfig)
+	if err := InitIgnoreList(true); err != nil {
+		return nil, errors.Wrap(err, "initializing filesystem ignore list")
+	}
+	logrus.Debugf("Ignore list: %v", ignorelist)
 
 	for _, opt := range opts {
 		opt(cfg)
@@ -137,12 +149,6 @@ func GetFSFromLayers(root string, layers []v1.Layer, opts ...FSOpt) ([]string, e
 	if cfg.extractFunc == nil {
 		return nil, errors.New("must supply an extract function")
 	}
-
-	if err := DetectFilesystemIgnoreList(config.IgnoreListPath); err != nil {
-		return nil, err
-	}
-
-	logrus.Debugf("Mounted directories: %v", ignorelist)
 
 	extractedFiles := []string{}
 	for i, l := range layers {
@@ -161,7 +167,7 @@ func GetFSFromLayers(root string, layers []v1.Layer, opts ...FSOpt) ([]string, e
 		tr := tar.NewReader(r)
 		for {
 			hdr, err := tr.Next()
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 
@@ -173,16 +179,27 @@ func GetFSFromLayers(root string, layers []v1.Layer, opts ...FSOpt) ([]string, e
 			base := filepath.Base(path)
 			dir := filepath.Dir(path)
 
-			if strings.HasPrefix(base, ".wh.") {
-				logrus.Debugf("Whiting out %s", path)
+			if strings.HasPrefix(base, archive.WhiteoutPrefix) {
+				logrus.Tracef("Whiting out %s", path)
 
-				name := strings.TrimPrefix(base, ".wh.")
-				if err := os.RemoveAll(filepath.Join(dir, name)); err != nil {
+				name := strings.TrimPrefix(base, archive.WhiteoutPrefix)
+				path := filepath.Join(dir, name)
+
+				if CheckIgnoreList(path) {
+					logrus.Tracef("Not deleting %s, as it's ignored", path)
+					continue
+				}
+				if childDirInIgnoreList(path) {
+					logrus.Tracef("Not deleting %s, as it contains a ignored path", path)
+					continue
+				}
+
+				if err := os.RemoveAll(path); err != nil {
 					return nil, errors.Wrapf(err, "removing whiteout %s", hdr.Name)
 				}
 
 				if !cfg.includeWhiteout {
-					logrus.Debug("not including whiteout files")
+					logrus.Trace("Not including whiteout files")
 					continue
 				}
 
@@ -204,7 +221,7 @@ func DeleteFilesystem() error {
 	return filepath.Walk(config.RootDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			// ignore errors when deleting.
-			return nil
+			return nil //nolint:nilerr
 		}
 
 		if CheckIgnoreList(path) {
@@ -247,13 +264,13 @@ func childDirInIgnoreList(path string) bool {
 	return false
 }
 
-// unTar returns a list of files that have been extracted from the tar archive at r to the path at dest
-func unTar(r io.Reader, dest string) ([]string, error) {
+// UnTar returns a list of files that have been extracted from the tar archive at r to the path at dest
+func UnTar(r io.Reader, dest string) ([]string, error) {
 	var extractedFiles []string
 	tr := tar.NewReader(r)
 	for {
 		hdr, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -286,13 +303,13 @@ func ExtractFile(dest string, hdr *tar.Header, tr io.Reader) error {
 	}
 	switch hdr.Typeflag {
 	case tar.TypeReg:
-		logrus.Tracef("creating file %s", path)
+		logrus.Tracef("Creating file %s", path)
 
 		// It's possible a file is in the tar before its directory,
 		// or a file was copied over a directory prior to now
 		fi, err := os.Stat(dir)
 		if os.IsNotExist(err) || !fi.IsDir() {
-			logrus.Debugf("base %s for file %s does not exist. Creating.", base, path)
+			logrus.Debugf("Base %s for file %s does not exist. Creating.", base, path)
 
 			if err := os.MkdirAll(dir, 0755); err != nil {
 				return err
@@ -320,25 +337,29 @@ func ExtractFile(dest string, hdr *tar.Header, tr io.Reader) error {
 			return err
 		}
 
+		if err = writeSecurityXattrToToFile(path, hdr); err != nil {
+			return err
+		}
+
 		if err = setFileTimes(path, hdr.AccessTime, hdr.ModTime); err != nil {
 			return err
 		}
 
 		currFile.Close()
 	case tar.TypeDir:
-		logrus.Tracef("creating dir %s", path)
-		if err := mkdirAllWithPermissions(path, mode, int64(uid), int64(gid)); err != nil {
+		logrus.Tracef("Creating dir %s", path)
+		if err := MkdirAllWithPermissions(path, mode, int64(uid), int64(gid)); err != nil {
 			return err
 		}
 
 	case tar.TypeLink:
-		logrus.Tracef("link from %s to %s", hdr.Linkname, path)
+		logrus.Tracef("Link from %s to %s", hdr.Linkname, path)
 		abs, err := filepath.Abs(hdr.Linkname)
 		if err != nil {
 			return err
 		}
 		if CheckIgnoreList(abs) {
-			logrus.Tracef("skipping symlink from %s to %s because %s is ignored", hdr.Linkname, path, hdr.Linkname)
+			logrus.Tracef("Skipping link from %s to %s because %s is ignored", hdr.Linkname, path, hdr.Linkname)
 			return nil
 		}
 		// The base directory for a link may not exist before it is created.
@@ -358,7 +379,7 @@ func ExtractFile(dest string, hdr *tar.Header, tr io.Reader) error {
 		}
 
 	case tar.TypeSymlink:
-		logrus.Tracef("symlink from %s to %s", hdr.Linkname, path)
+		logrus.Tracef("Symlink from %s to %s", hdr.Linkname, path)
 		// The base directory for a symlink may not exist before it is created.
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return err
@@ -377,20 +398,21 @@ func ExtractFile(dest string, hdr *tar.Header, tr io.Reader) error {
 	return nil
 }
 
-func IsInIgnoreList(path string) bool {
-	return IsInProvidedIgnoreList(path, ignorelist)
-}
-
 func IsInProvidedIgnoreList(path string, wl []IgnoreListEntry) bool {
 	for _, entry := range wl {
 		if !entry.PrefixMatchOnly && path == entry.Path {
 			return true
 		}
 	}
+
 	return false
 }
 
-func CheckIgnoreList(path string) bool {
+func IsInIgnoreList(path string) bool {
+	return IsInProvidedIgnoreList(path, ignorelist)
+}
+
+func CheckProvidedIgnoreList(path string, wl []IgnoreListEntry) bool {
 	for _, wl := range ignorelist {
 		if HasFilepathPrefix(path, wl.Path, wl.PrefixMatchOnly) {
 			return true
@@ -398,6 +420,10 @@ func CheckIgnoreList(path string) bool {
 	}
 
 	return false
+}
+
+func CheckIgnoreList(path string) bool {
+	return CheckProvidedIgnoreList(path, ignorelist)
 }
 
 func checkIgnoreListRoot(root string) bool {
@@ -414,8 +440,7 @@ func checkIgnoreListRoot(root string) bool {
 // Where (5) is the mount point relative to the process's root
 // From: https://www.kernel.org/doc/Documentation/filesystems/proc.txt
 func DetectFilesystemIgnoreList(path string) error {
-	ignorelist = initialIgnoreList
-	volumes = []string{}
+	logrus.Trace("Detecting filesystem ignore list")
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -425,7 +450,7 @@ func DetectFilesystemIgnoreList(path string) error {
 	for {
 		line, err := reader.ReadString('\n')
 		logrus.Tracef("Read the following line from %s: %s", path, line)
-		if err != nil && err != io.EOF {
+		if err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
 		lineArr := strings.Split(line, " ")
@@ -437,7 +462,7 @@ func DetectFilesystemIgnoreList(path string) error {
 			continue
 		}
 		if lineArr[4] != config.RootDir {
-			logrus.Tracef("Appending %s from line: %s", lineArr[4], line)
+			logrus.Tracef("Adding ignore list entry %s from line: %s", lineArr[4], line)
 			ignorelist = append(ignorelist, IgnoreListEntry{
 				Path:            lineArr[4],
 				PrefixMatchOnly: false,
@@ -516,11 +541,40 @@ func FilepathExists(path string) bool {
 	return !os.IsNotExist(err)
 }
 
+// resetFileOwnershipIfNotMatching function changes ownership of the file at path to newUID and newGID.
+// If the ownership already matches, chown is not executed.
+func resetFileOwnershipIfNotMatching(path string, newUID, newGID uint32) error {
+	fsInfo, err := os.Lstat(path)
+	if err != nil {
+		return errors.Wrap(err, "getting stat of present file")
+	}
+	stat, ok := fsInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("can't convert fs.FileInfo of %v to linux syscall.Stat_t", path)
+	}
+	if stat.Uid != newUID && stat.Gid != newGID {
+		err = os.Chown(path, int(newUID), int(newGID))
+		if err != nil {
+			return errors.Wrap(err, "reseting file ownership to root")
+		}
+	}
+	return nil
+}
+
 // CreateFile creates a file at path and copies over contents from the reader
 func CreateFile(path string, reader io.Reader, perm os.FileMode, uid uint32, gid uint32) error {
 	// Create directory path if it doesn't exist
 	if err := createParentDirectory(path); err != nil {
 		return errors.Wrap(err, "creating parent dir")
+	}
+
+	// if the file is already created with ownership other than root, reset the ownership
+	if FilepathExists(path) {
+		logrus.Debugf("file at %v already exists, resetting file ownership to root", path)
+		err := resetFileOwnershipIfNotMatching(path, 0, 0)
+		if err != nil {
+			return errors.Wrap(err, "reseting file ownership")
+		}
 	}
 
 	dest, err := os.Create(path)
@@ -536,7 +590,7 @@ func CreateFile(path string, reader io.Reader, perm os.FileMode, uid uint32, gid
 
 // AddVolumePath adds the given path to the volume ignorelist.
 func AddVolumePathToIgnoreList(path string) {
-	logrus.Infof("adding volume %s to ignorelist", path)
+	logrus.Infof("Adding volume %s to ignorelist", path)
 	ignorelist = append(ignorelist, IgnoreListEntry{
 		Path:            path,
 		PrefixMatchOnly: true,
@@ -546,11 +600,11 @@ func AddVolumePathToIgnoreList(path string) {
 
 // DownloadFileToDest downloads the file at rawurl to the given dest for the ADD command
 // From add command docs:
-// 	1. If <src> is a remote file URL:
-// 		- destination will have permissions of 0600
-// 		- If remote file has HTTP Last-Modified header, we set the mtime of the file to that timestamp
+//  1. If <src> is a remote file URL:
+//     - destination will have permissions of 0600
+//     - If remote file has HTTP Last-Modified header, we set the mtime of the file to that timestamp
 func DownloadFileToDest(rawurl, dest string, uid, gid int64) error {
-	resp, err := http.Get(rawurl)
+	resp, err := http.Get(rawurl) //nolint:noctx
 	if err != nil {
 		return err
 	}
@@ -608,8 +662,8 @@ func CopyDir(src, dest string, context FileContext, uid, gid int64) ([]string, e
 			logrus.Tracef("Creating directory %s", destPath)
 
 			mode := fi.Mode()
-			uid, gid = DetermineTargetFileOwnership(fi, uid, gid)
-			if err := mkdirAllWithPermissions(destPath, mode, uid, gid); err != nil {
+			uid, gid := DetermineTargetFileOwnership(fi, uid, gid)
+			if err := MkdirAllWithPermissions(destPath, mode, uid, gid); err != nil {
 				return nil, err
 			}
 		} else if IsSymlink(fi) {
@@ -644,7 +698,7 @@ func CopySymlink(src, dest string, context FileContext) (bool, error) {
 	}
 	link, err := os.Readlink(src)
 	if err != nil {
-		logrus.Debugf("could not read link for %s", src)
+		logrus.Debugf("Could not read link for %s", src)
 	}
 	return false, os.Symlink(link, dest)
 }
@@ -710,13 +764,13 @@ func (c FileContext) ExcludesFile(path string) bool {
 		var err error
 		path, err = filepath.Rel(c.Root, path)
 		if err != nil {
-			logrus.Errorf("unable to get relative path, including %s in build: %v", path, err)
+			logrus.Errorf("Unable to get relative path, including %s in build: %v", path, err)
 			return false
 		}
 	}
 	match, err := fileutils.Matches(path, c.ExcludedFiles)
 	if err != nil {
-		logrus.Errorf("error matching, including %s in build: %v", path, err)
+		logrus.Errorf("Error matching, including %s in build: %v", path, err)
 		return false
 	}
 	return match
@@ -752,14 +806,17 @@ func Volumes() []string {
 	return volumes
 }
 
-func mkdirAllWithPermissions(path string, mode os.FileMode, uid, gid int64) error {
+func MkdirAllWithPermissions(path string, mode os.FileMode, uid, gid int64) error {
 	// Check if a file already exists on the path, if yes then delete it
 	info, err := os.Stat(path)
-	if !os.IsNotExist(err) && !info.IsDir() {
-		logrus.Tracef("removing file because it needs to be a directory %s", path)
+	if err == nil && !info.IsDir() {
+		logrus.Tracef("Removing file because it needs to be a directory %s", path)
 		if err := os.Remove(path); err != nil {
 			return errors.Wrapf(err, "error removing %s to make way for new directory.", path)
 		}
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return errors.Wrapf(err, "error calling stat on %s.", path)
 	}
 
 	if err := os.MkdirAll(path, mode); err != nil {
@@ -767,7 +824,12 @@ func mkdirAllWithPermissions(path string, mode os.FileMode, uid, gid int64) erro
 	}
 	if uid > math.MaxUint32 || gid > math.MaxUint32 {
 		// due to https://github.com/golang/go/issues/8537
-		return errors.New(fmt.Sprintf("Numeric User-ID or Group-ID greater than %v are not properly supported.", uint64(math.MaxUint32)))
+		return errors.New(
+			fmt.Sprintf(
+				"Numeric User-ID or Group-ID greater than %v are not properly supported.",
+				uint64(math.MaxUint32),
+			),
+		)
 	}
 	if err := os.Chown(path, int(uid), int(gid)); err != nil {
 		return err
@@ -791,12 +853,12 @@ func setFileTimes(path string, aTime, mTime time.Time) error {
 	// converted into a valid argument to the syscall that os.Chtimes uses. If mTime or
 	// aTime are zero we convert them to the zero value for Unix Epoch.
 	if mTime.IsZero() {
-		logrus.Tracef("mod time for %s is zero, converting to zero for epoch", path)
+		logrus.Tracef("Mod time for %s is zero, converting to zero for epoch", path)
 		mTime = time.Unix(0, 0)
 	}
 
 	if aTime.IsZero() {
-		logrus.Tracef("access time for %s is zero, converting to zero for epoch", path)
+		logrus.Tracef("Access time for %s is zero, converting to zero for epoch", path)
 		aTime = time.Unix(0, 0)
 	}
 
@@ -819,13 +881,12 @@ func setFileTimes(path string, aTime, mTime time.Time) error {
 func CreateTargetTarfile(tarpath string) (*os.File, error) {
 	baseDir := filepath.Dir(tarpath)
 	if _, err := os.Lstat(baseDir); os.IsNotExist(err) {
-		logrus.Debugf("baseDir %s for file %s does not exist. Creating.", baseDir, tarpath)
+		logrus.Debugf("BaseDir %s for file %s does not exist. Creating.", baseDir, tarpath)
 		if err := os.MkdirAll(baseDir, 0755); err != nil {
 			return nil, err
 		}
 	}
 	return os.Create(tarpath)
-
 }
 
 // Returns true if a file is a symlink
@@ -866,7 +927,11 @@ func getSymlink(path string) error {
 func CopyFileOrSymlink(src string, destDir string, root string) error {
 	destFile := filepath.Join(destDir, src)
 	src = filepath.Join(root, src)
-	if fi, _ := os.Lstat(src); IsSymlink(fi) {
+	fi, err := os.Lstat(src)
+	if err != nil {
+		return errors.Wrap(err, "getting file info")
+	}
+	if IsSymlink(fi) {
 		link, err := os.Readlink(src)
 		if err != nil {
 			return errors.Wrap(err, "copying file or symlink")
@@ -876,36 +941,93 @@ func CopyFileOrSymlink(src string, destDir string, root string) error {
 		}
 		return os.Symlink(link, destFile)
 	}
-	return otiai10Cpy.Copy(src, destFile)
+	if err := otiai10Cpy.Copy(src, destFile); err != nil {
+		return errors.Wrap(err, "copying file")
+	}
+	if err := CopyOwnership(src, destDir, root); err != nil {
+		return errors.Wrap(err, "copying ownership")
+	}
+	if err := os.Chmod(destFile, fi.Mode()); err != nil {
+		return errors.Wrap(err, "copying file mode")
+	}
+	return nil
+}
+
+// CopyOwnership copies the file or directory ownership recursively at src to dest
+func CopyOwnership(src string, destDir string, root string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if IsSymlink(info) {
+			return nil
+		}
+		relPath, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		destPath := filepath.Join(destDir, relPath)
+
+		if CheckIgnoreList(src) && CheckIgnoreList(destPath) {
+			if !isExist(destPath) {
+				logrus.Debugf("Path %s ignored, but not exists", destPath)
+				return nil
+			}
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			logrus.Debugf("Not copying ownership for %s, as it's ignored", destPath)
+			return nil
+		}
+		if CheckIgnoreList(destDir) && CheckIgnoreList(path) {
+			if !isExist(path) {
+				logrus.Debugf("Path %s ignored, but not exists", path)
+				return nil
+			}
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			logrus.Debugf("Not copying ownership for %s, as it's ignored", path)
+			return nil
+		}
+
+		info, err = os.Stat(path)
+		if err != nil {
+			return errors.Wrap(err, "reading ownership")
+		}
+		stat := info.Sys().(*syscall.Stat_t)
+		return os.Chown(destPath, int(stat.Uid), int(stat.Gid))
+	})
 }
 
 func createParentDirectory(path string) error {
 	baseDir := filepath.Dir(path)
 	if info, err := os.Lstat(baseDir); os.IsNotExist(err) {
-		logrus.Tracef("baseDir %s for file %s does not exist. Creating.", baseDir, path)
+		logrus.Tracef("BaseDir %s for file %s does not exist. Creating.", baseDir, path)
 		if err := os.MkdirAll(baseDir, 0755); err != nil {
 			return err
 		}
 	} else if IsSymlink(info) {
-		logrus.Infof("destination cannot be a symlink %v", baseDir)
+		logrus.Infof("Destination cannot be a symlink %v", baseDir)
 		return errors.New("destination cannot be a symlink")
 	}
 	return nil
 }
 
-// UpdateInitialIgnoreList will add /var/run to ignored paths if
-func UpdateInitialIgnoreList(ignoreVarRun bool) {
-	if !ignoreVarRun {
-		return
+// InitIgnoreList will initialize the ignore list using:
+// - defaultIgnoreList
+// - mounted paths via DetectFilesystemIgnoreList()
+func InitIgnoreList(detectFilesystem bool) error {
+	logrus.Trace("Initializing ignore list")
+	ignorelist = append([]IgnoreListEntry{}, defaultIgnoreList...)
+
+	if detectFilesystem {
+		if err := DetectFilesystemIgnoreList(config.IgnoreListPath); err != nil {
+			return errors.Wrap(err, "checking filesystem mount paths for ignore list")
+		}
 	}
-	logrus.Trace("Adding /var/run to initialIgnoreList ")
-	initialIgnoreList = append(initialIgnoreList, IgnoreListEntry{
-		// /var/run is a special case. It's common to mount in /var/run/docker.sock or something similar
-		// which leads to a special mount on the /var/run/docker.sock file itself, but the directory to exist
-		// in the image with no way to tell if it came from the base image or not.
-		Path:            "/var/run",
-		PrefixMatchOnly: false,
-	})
+
+	return nil
 }
 
 type walkFSResult struct {
@@ -913,22 +1035,28 @@ type walkFSResult struct {
 	existingPaths map[string]struct{}
 }
 
-// WalkFS given a directory and list of existing files,
-// returns a list of changed filed determined by changeFunc and a list
-// of deleted files.
-// It timesout after 90 mins. Can be configured via setting an environment variable
+// WalkFS given a directory dir and list of existing files existingPaths,
+// returns a list of changed files determined by `changeFunc` and a list
+// of deleted files. Input existingPaths is changed inside this function and
+// returned as deleted files map.
+// It timesout after 90 mins which can be configured via setting an environment variable
 // SNAPSHOT_TIMEOUT in the kaniko pod definition.
-func WalkFS(dir string, existingPaths map[string]struct{}, changeFunc func(string) (bool, error)) ([]string, map[string]struct{}) {
+func WalkFS(
+	dir string,
+	existingPaths map[string]struct{},
+	changeFunc func(string) (bool, error),
+) ([]string, map[string]struct{}) {
 	timeOutStr := os.Getenv(snapshotTimeout)
 	if timeOutStr == "" {
-		logrus.Tracef("%s environment not set. Using default snapshot timeout %s", snapshotTimeout, defaultTimeout)
+		logrus.Tracef("Environment '%s' not set. Using default snapshot timeout '%s'", snapshotTimeout, defaultTimeout)
 		timeOutStr = defaultTimeout
 	}
 	timeOut, err := time.ParseDuration(timeOutStr)
 	if err != nil {
-		logrus.Fatalf("could not parse duration %s", timeOutStr)
+		logrus.Fatalf("Could not parse duration '%s'", timeOutStr)
 	}
 	timer := timing.Start("Walking filesystem with timeout")
+
 	ch := make(chan walkFSResult, 1)
 
 	go func() {
@@ -942,35 +1070,45 @@ func WalkFS(dir string, existingPaths map[string]struct{}, changeFunc func(strin
 		return res.filesAdded, res.existingPaths
 	case <-time.After(timeOut):
 		timing.DefaultRun.Stop(timer)
-		logrus.Fatalf("timed out snapshotting FS in %s", timeOutStr)
+		logrus.Fatalf("Timed out snapshotting FS in %s", timeOutStr)
 		return nil, nil
 	}
 }
 
 func gowalkDir(dir string, existingPaths map[string]struct{}, changeFunc func(string) (bool, error)) walkFSResult {
 	foundPaths := make([]string, 0)
-	godirwalk.Walk(dir, &godirwalk.Options{
-		Callback: func(path string, ent *godirwalk.Dirent) error {
-			logrus.Tracef("Analyzing path %s", path)
-			if IsInIgnoreList(path) {
-				if IsDestDir(path) {
-					logrus.Tracef("Skipping paths under %s, as it is a ignored directory", path)
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			delete(existingPaths, path)
-			if t, err := changeFunc(path); err != nil {
-				return err
-			} else if t {
-				foundPaths = append(foundPaths, path)
+	deletedFiles := existingPaths // Make a reference.
+
+	callback := func(path string, ent *godirwalk.Dirent) error {
+		logrus.Tracef("Analyzing path '%s'", path)
+
+		if IsInIgnoreList(path) {
+			if IsDestDir(path) {
+				logrus.Tracef("Skipping paths under '%s', as it is an ignored directory", path)
+				return filepath.SkipDir
 			}
 			return nil
-		},
-		Unsorted: true,
-	},
-	)
-	return walkFSResult{foundPaths, existingPaths}
+		}
+
+		// File is existing on disk, remove it from deleted files.
+		delete(deletedFiles, path)
+
+		if isChanged, err := changeFunc(path); err != nil {
+			return err
+		} else if isChanged {
+			foundPaths = append(foundPaths, path)
+		}
+
+		return nil
+	}
+
+	godirwalk.Walk(dir,
+		&godirwalk.Options{
+			Callback: callback,
+			Unsorted: true,
+		})
+
+	return walkFSResult{foundPaths, deletedFiles}
 }
 
 // GetFSInfoMap given a directory gets a map of FileInfo for all files
@@ -980,7 +1118,7 @@ func GetFSInfoMap(dir string, existing map[string]os.FileInfo) (map[string]os.Fi
 	timer := timing.Start("Walking filesystem with Stat")
 	godirwalk.Walk(dir, &godirwalk.Options{
 		Callback: func(path string, ent *godirwalk.Dirent) error {
-			if IsInIgnoreList(path) {
+			if CheckIgnoreList(path) {
 				if IsDestDir(path) {
 					logrus.Tracef("Skipping paths under %s, as it is a ignored directory", path)
 					return filepath.SkipDir
@@ -999,7 +1137,6 @@ func GetFSInfoMap(dir string, existing map[string]os.FileInfo) (map[string]os.Fi
 					fileMap[path] = fi
 					foundPaths = append(foundPaths, path)
 				}
-
 			}
 			return nil
 		},

@@ -51,14 +51,20 @@ func (b *BuildArgs) Clone() *BuildArgs {
 
 // ReplacementEnvs returns a list of filtered environment variables
 func (b *BuildArgs) ReplacementEnvs(envs []string) []string {
+	// Ensure that we operate on a new array and do not modify the underlying array
+	resultEnv := make([]string, len(envs))
+	copy(resultEnv, envs)
 	filtered := b.FilterAllowed(envs)
-	return append(envs, filtered...)
+	// Disable makezero linter, since the previous make is paired with a same sized copy
+	return append(resultEnv, filtered...) //nolint:makezero
 }
 
 // AddMetaArgs adds the supplied args map to b's allowedMetaArgs
 func (b *BuildArgs) AddMetaArgs(metaArgs []instructions.ArgCommand) {
-	for _, arg := range metaArgs {
-		v := arg.Value
-		b.AddMetaArg(arg.Key, v)
+	for _, marg := range metaArgs {
+		for _, arg := range marg.Args {
+			v := arg.Value
+			b.AddMetaArg(arg.Key, v)
+		}
 	}
 }

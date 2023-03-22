@@ -17,20 +17,32 @@ package validate
 import (
 	"archive/tar"
 	"compress/gzip"
-	"crypto/sha256"
+	"crypto"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"strings"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/partial"
 )
 
 // Layer validates that the values return by its methods are consistent with the
 // contents returned by Compressed and Uncompressed.
-func Layer(layer v1.Layer) error {
+func Layer(layer v1.Layer, opt ...Option) error {
+	o := makeOptions(opt...)
+	if o.fast {
+		ok, err := partial.Exists(layer)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("layer does not exist")
+		}
+		return nil
+	}
+
 	cl, err := computeLayer(layer)
 	if err != nil {
 		return err
@@ -92,7 +104,7 @@ func computeLayer(layer v1.Layer) (*computedLayer, error) {
 	}
 
 	// Keep track of compressed digest.
-	digester := sha256.New()
+	digester := crypto.SHA256.New()
 	// Everything read from compressed is written to digester to compute digest.
 	hashCompressed := io.TeeReader(compressed, digester)
 
@@ -120,7 +132,7 @@ func computeLayer(layer v1.Layer) (*computedLayer, error) {
 	if err != nil {
 		return nil, err
 	}
-	diffider := sha256.New()
+	diffider := crypto.SHA256.New()
 	hashUncompressed := io.TeeReader(uncompressed, diffider)
 
 	// Ensure there aren't duplicate file paths.
@@ -128,7 +140,7 @@ func computeLayer(layer v1.Layer) (*computedLayer, error) {
 	files := make(map[string]struct{})
 	for {
 		hdr, err := tarReader.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -141,7 +153,7 @@ func computeLayer(layer v1.Layer) (*computedLayer, error) {
 	}
 
 	// Discard any trailing padding that the tar.Reader doesn't consume.
-	if _, err := io.Copy(ioutil.Discard, hashUncompressed); err != nil {
+	if _, err := io.Copy(io.Discard, hashUncompressed); err != nil {
 		return nil, err
 	}
 

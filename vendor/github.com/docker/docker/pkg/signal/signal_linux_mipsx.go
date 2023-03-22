@@ -1,3 +1,4 @@
+//go:build linux && (mips || mipsle || mips64 || mips64le)
 // +build linux
 // +build mips mipsle mips64 mips64le
 
@@ -35,7 +36,7 @@ var SignalMap = map[string]syscall.Signal{
 	"PWR":      unix.SIGPWR,
 	"QUIT":     unix.SIGQUIT,
 	"SEGV":     unix.SIGSEGV,
-	"SIGEMT":   unix.SIGEMT,
+	"EMT":      unix.SIGEMT,
 	"STOP":     unix.SIGSTOP,
 	"SYS":      unix.SIGSYS,
 	"TERM":     unix.SIGTERM,

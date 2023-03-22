@@ -98,7 +98,7 @@ func MultiRefWrite(refToImage map[name.Reference]v1.Image, w io.Writer, opts ...
 		}
 	}
 
-	size, _, mBytes, err := getSizeAndManifest(refToImage)
+	size, mBytes, err := getSizeAndManifest(refToImage)
 	if err != nil {
 		return sendUpdateReturn(o, err)
 	}
@@ -222,6 +222,10 @@ func writeImagesToTar(refToImage map[name.Reference]v1.Image, m []byte, size int
 func calculateManifest(refToImage map[name.Reference]v1.Image) (m Manifest, err error) {
 	imageToTags := dedupRefToImage(refToImage)
 
+	if len(imageToTags) == 0 {
+		return nil, errors.New("set of images is empty")
+	}
+
 	for img, tags := range imageToTags {
 		cfgName, err := img.ConfigName()
 		if err != nil {
@@ -286,38 +290,44 @@ func calculateManifest(refToImage map[name.Reference]v1.Image) (m Manifest, err 
 
 // CalculateSize calculates the expected complete size of the output tar file
 func CalculateSize(refToImage map[name.Reference]v1.Image) (size int64, err error) {
-	size, _, _, err = getSizeAndManifest(refToImage)
+	size, _, err = getSizeAndManifest(refToImage)
 	return size, err
 }
 
-func getSizeAndManifest(refToImage map[name.Reference]v1.Image) (size int64, m Manifest, mBytes []byte, err error) {
-	m, err = calculateManifest(refToImage)
+func getSizeAndManifest(refToImage map[name.Reference]v1.Image) (int64, []byte, error) {
+	m, err := calculateManifest(refToImage)
 	if err != nil {
-		return 0, nil, nil, fmt.Errorf("unable to calculate manifest: %v", err)
+		return 0, nil, fmt.Errorf("unable to calculate manifest: %w", err)
 	}
-	mBytes, err = json.Marshal(m)
+	mBytes, err := json.Marshal(m)
 	if err != nil {
-		return 0, nil, nil, fmt.Errorf("could not marshall manifest to bytes: %v", err)
+		return 0, nil, fmt.Errorf("could not marshall manifest to bytes: %w", err)
 	}
 
-	size, err = calculateTarballSize(refToImage, mBytes)
+	size, err := calculateTarballSize(refToImage, mBytes)
 	if err != nil {
-		return 0, nil, nil, fmt.Errorf("error calculating tarball size: %v", err)
+		return 0, nil, fmt.Errorf("error calculating tarball size: %w", err)
 	}
-	return size, m, mBytes, nil
+	return size, mBytes, nil
 }
 
 // calculateTarballSize calculates the size of the tar file
 func calculateTarballSize(refToImage map[name.Reference]v1.Image, mBytes []byte) (size int64, err error) {
 	imageToTags := dedupRefToImage(refToImage)
 
+	seenLayerDigests := make(map[string]struct{})
 	for img, name := range imageToTags {
 		manifest, err := img.Manifest()
 		if err != nil {
-			return size, fmt.Errorf("unable to get manifest for img %s: %v", name, err)
+			return size, fmt.Errorf("unable to get manifest for img %s: %w", name, err)
 		}
 		size += calculateSingleFileInTarSize(manifest.Config.Size)
 		for _, l := range manifest.Layers {
+			hex := l.Digest.Hex
+			if _, ok := seenLayerDigests[hex]; ok {
+				continue
+			}
+			seenLayerDigests[hex] = struct{}{}
 			size += calculateSingleFileInTarSize(l.Size)
 		}
 	}
@@ -334,15 +344,24 @@ func dedupRefToImage(refToImage map[name.Reference]v1.Image) map[v1.Image][]stri
 
 	for ref, img := range refToImage {
 		if tag, ok := ref.(name.Tag); ok {
-			if tags, ok := imageToTags[img]; ok && tags != nil {
-				imageToTags[img] = append(tags, tag.String())
-			} else {
-				imageToTags[img] = []string{tag.String()}
+			if tags, ok := imageToTags[img]; !ok || tags == nil {
+				imageToTags[img] = []string{}
 			}
-		} else {
-			if _, ok := imageToTags[img]; !ok {
-				imageToTags[img] = nil
+			// Docker cannot load tarballs without an explicit tag:
+			// https://github.com/google/go-containerregistry/issues/890
+			//
+			// We can't use the fully qualified tag.Name() because of rules_docker:
+			// https://github.com/google/go-containerregistry/issues/527
+			//
+			// If the tag is "latest", but tag.String() doesn't end in ":latest",
+			// just append it. Kind of gross, but should work for now.
+			ts := tag.String()
+			if tag.Identifier() == name.DefaultTag && !strings.HasSuffix(ts, ":"+name.DefaultTag) {
+				ts = fmt.Sprintf("%s:%s", ts, name.DefaultTag)
 			}
+			imageToTags[img] = append(imageToTags[img], ts)
+		} else if _, ok := imageToTags[img]; !ok {
+			imageToTags[img] = nil
 		}
 	}
 

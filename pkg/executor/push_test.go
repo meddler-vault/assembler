@@ -22,24 +22,18 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 
 	"github.com/GoogleContainerTools/kaniko/pkg/config"
+	"github.com/GoogleContainerTools/kaniko/pkg/util"
 	"github.com/GoogleContainerTools/kaniko/testutil"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/layout"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/validate"
-
 	"github.com/spf13/afero"
-)
-
-const (
-	DefaultKanikoDockerConfigJSON = "/kaniko/.docker/config.json"
-	DockerConfigEnvKey            = "DOCKER_CONFIG"
 )
 
 func mustTag(t *testing.T, s string) name.Tag {
@@ -48,107 +42,6 @@ func mustTag(t *testing.T, s string) name.Tag {
 		t.Fatalf("NewTag: %v", err)
 	}
 	return tag
-}
-
-func TestDockerConfLocationWithFileLocation(t *testing.T) {
-	originalDockerConfig := os.Getenv(DockerConfigEnvKey)
-	if err := os.Unsetenv(DockerConfigEnvKey); err != nil {
-		t.Fatalf("Failed to unset DOCKER_CONFIG: %v", err)
-	}
-	file, err := ioutil.TempFile("", "docker.conf")
-	if err != nil {
-		t.Fatalf("could not create temp file: %s", err)
-	}
-	defer os.Remove(file.Name())
-	if err := os.Setenv(DockerConfigEnvKey, file.Name()); err != nil {
-		t.Fatalf("Failed to unset DOCKER_CONFIG: %v", err)
-	}
-	unset := DockerConfLocation()
-	unsetExpected := file.Name()
-	if unset != unsetExpected {
-		t.Errorf("Unexpected default Docker configuration file location: expected:'%s' got:'%s'", unsetExpected, unset)
-	}
-	restoreOriginalDockerConfigEnv(t, originalDockerConfig)
-}
-
-func TestDockerConfLocationWithInvalidFileLocation(t *testing.T) {
-	originalDockerConfig := os.Getenv(DockerConfigEnvKey)
-	if err := os.Unsetenv(DockerConfigEnvKey); err != nil {
-		t.Fatalf("Failed to unset DOCKER_CONFIG: %v", err)
-	}
-	tmpDir, err := ioutil.TempDir("", "*")
-	if err != nil {
-		t.Fatalf("could not create temp dir: %s", err)
-	}
-	defer os.RemoveAll(tmpDir)
-	random := "fdgdsfrdfgdf-fdfsf-24dsgfd" //replace with a really random string
-	file := filepath.Join(tmpDir, random)  // an random file name, shouldn't exist
-	if err := os.Setenv(DockerConfigEnvKey, file); err != nil {
-		t.Fatalf("Failed to unset DOCKER_CONFIG: %v", err)
-	}
-	unset := DockerConfLocation()
-	// as file doesn't point to a real file,  DockerConfLocation() should return the default kaniko path for config.json
-	unsetExpected := DefaultKanikoDockerConfigJSON
-	if unset != unsetExpected {
-		t.Errorf("Unexpected default Docker configuration file location: expected:'%s' got:'%s'", unsetExpected, unset)
-	}
-	restoreOriginalDockerConfigEnv(t, originalDockerConfig)
-}
-
-func TestDockerConfLocation(t *testing.T) {
-	originalDockerConfig := os.Getenv(DockerConfigEnvKey)
-
-	if err := os.Unsetenv(DockerConfigEnvKey); err != nil {
-		t.Fatalf("Failed to unset DOCKER_CONFIG: %v", err)
-	}
-	unset := DockerConfLocation()
-	unsetExpected := DefaultKanikoDockerConfigJSON // will fail on Windows
-	if unset != unsetExpected {
-		t.Errorf("Unexpected default Docker configuration file location: expected:'%s' got:'%s'", unsetExpected, unset)
-	}
-	tmpDir, err := ioutil.TempDir("", "*")
-	if err != nil {
-		t.Fatalf("could not create temp dir: %s", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	dir := filepath.Join(tmpDir, "/kaniko/.docker")
-	os.MkdirAll(dir, os.ModePerm)
-	if err := os.Setenv(DockerConfigEnvKey, dir); err != nil {
-		t.Fatalf("Failed to set DOCKER_CONFIG: %v", err)
-	}
-	kanikoDefault := DockerConfLocation()
-	kanikoDefaultExpected := filepath.Join(tmpDir, DefaultKanikoDockerConfigJSON) // will fail on Windows
-	if kanikoDefault != kanikoDefaultExpected {
-		t.Errorf("Unexpected kaniko default Docker conf file location: expected:'%s' got:'%s'", kanikoDefaultExpected, kanikoDefault)
-	}
-
-	differentPath, err := ioutil.TempDir("", "differentPath")
-	if err != nil {
-		t.Fatalf("could not create temp dir: %s", err)
-	}
-	defer os.RemoveAll(differentPath)
-	if err := os.Setenv(DockerConfigEnvKey, differentPath); err != nil {
-		t.Fatalf("Failed to set DOCKER_CONFIG: %v", err)
-	}
-	set := DockerConfLocation()
-	setExpected := filepath.Join(differentPath, "config.json") // will fail on Windows ?
-	if set != setExpected {
-		t.Errorf("Unexpected DOCKER_CONF-based file location: expected:'%s' got:'%s'", setExpected, set)
-	}
-	restoreOriginalDockerConfigEnv(t, originalDockerConfig)
-}
-
-func restoreOriginalDockerConfigEnv(t *testing.T, originalDockerConfig string) {
-	if originalDockerConfig != "" {
-		if err := os.Setenv(DockerConfigEnvKey, originalDockerConfig); err != nil {
-			t.Fatalf("Failed to set DOCKER_CONFIG back to original value '%s': %v", originalDockerConfig, err)
-		}
-	} else {
-		if err := os.Unsetenv(DockerConfigEnvKey); err != nil {
-			t.Fatalf("Failed to unset DOCKER_CONFIG after testing: %v", err)
-		}
-	}
 }
 
 func TestWriteImageOutputs(t *testing.T) {
@@ -234,7 +127,7 @@ func TestHeaderAdded(t *testing.T) {
 				os.Setenv("UPSTREAM_CLIENT_TYPE", test.upstream)
 				defer func() { os.Unsetenv("UPSTREAM_CLIENT_TYPE") }()
 			}
-			req, err := http.NewRequest("GET", "dummy", nil)
+			req, err := http.NewRequest("GET", "dummy", nil) //nolint:noctx
 			if err != nil {
 				t.Fatalf("culd not create a req due to %s", err)
 			}
@@ -257,11 +150,7 @@ func (m *mockRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 func TestOCILayoutPath(t *testing.T) {
-	tmpDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("could not create temp dir: %s", err)
-	}
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	image, err := random.Image(1024, 4)
 	if err != nil {
@@ -363,84 +252,99 @@ func TestImageNameTagDigestFile(t *testing.T) {
 	testutil.CheckErrorAndDeepEqual(t, false, err, want, got)
 }
 
-var calledExecCommand = []bool{}
-var calledCheckPushPermission = false
+var checkPushPermsCallCount = 0
 
-func setCalledFalse() {
-	calledExecCommand = []bool{}
-	calledCheckPushPermission = false
-}
-
-func fakeExecCommand(command string, args ...string) *exec.Cmd {
-	calledExecCommand = append(calledExecCommand, true)
-	cs := []string{"-test.run=TestHelperProcess", "--", command}
-	cs = append(cs, args...)
-	cmd := exec.Command(os.Args[0], cs...)
-	cmd.Env = []string{"GO_WANT_HELPER_PROCESS=1"}
-	return cmd
+func resetCalledCount() {
+	checkPushPermsCallCount = 0
 }
 
 func fakeCheckPushPermission(ref name.Reference, kc authn.Keychain, t http.RoundTripper) error {
-	calledCheckPushPermission = true
+	checkPushPermsCallCount++
 	return nil
 }
 
 func TestCheckPushPermissions(t *testing.T) {
 	tests := []struct {
-		description           string
-		Destination           []string
-		ShouldCallExecCommand []bool
-		ExistingConfig        bool
+		description                     string
+		cacheRepo                       string
+		checkPushPermsExpectedCallCount int
+		destinations                    []string
+		existingConfig                  bool
+		noPush                          bool
+		noPushCache                     bool
 	}{
-		{"a gcr image without config", []string{"gcr.io/test-image"}, []bool{true}, false},
-		{"a gcr image with config", []string{"gcr.io/test-image"}, []bool{false}, true},
-		{"a pkg.dev image without config", []string{"us-docker.pkg.dev/test-image"}, []bool{true}, false},
-		{"a pkg.dev image with config", []string{"us-docker.pkg.dev/test-image"}, []bool{false}, true},
-		{"localhost registry with config", []string{"localhost:5000/test-image"}, []bool{false}, false},
-		{"localhost registry without config", []string{"localhost:5000/test-image"}, []bool{false}, true},
-		{"any other registry", []string{"notgcr.io/test-image"}, []bool{false}, false},
-		{"multiple destinations pushed to different registry",
-			[]string{
+		{description: "a gcr image without config", destinations: []string{"gcr.io/test-image"}, checkPushPermsExpectedCallCount: 1},
+		{description: "a gcr image with config", destinations: []string{"gcr.io/test-image"}, existingConfig: true, checkPushPermsExpectedCallCount: 1},
+		{description: "a pkg.dev image without config", destinations: []string{"us-docker.pkg.dev/test-image"}, checkPushPermsExpectedCallCount: 1},
+		{description: "a pkg.dev image with config", destinations: []string{"us-docker.pkg.dev/test-image"}, existingConfig: true, checkPushPermsExpectedCallCount: 1},
+		{description: "localhost registry without config", destinations: []string{"localhost:5000/test-image"}, checkPushPermsExpectedCallCount: 1},
+		{description: "localhost registry with config", destinations: []string{"localhost:5000/test-image"}, existingConfig: true, checkPushPermsExpectedCallCount: 1},
+		{description: "any other registry", destinations: []string{"notgcr.io/test-image"}, checkPushPermsExpectedCallCount: 1},
+		{
+			description: "multiple destinations pushed to different registry",
+			destinations: []string{
 				"us-central1-docker.pkg.dev/prj/test-image",
 				"us-west-docker.pkg.dev/prj/test-image",
 			},
-			[]bool{true, true}, false,
+			checkPushPermsExpectedCallCount: 2,
 		},
-		{"same image names with different tags",
-			[]string{
+		{
+			description: "same image names with different tags",
+			destinations: []string{
 				"us-central1-docker.pkg.dev/prj/test-image:tag1",
 				"us-central1-docker.pkg.dev/prj/test-image:tag2",
 			},
-			[]bool{true, true}, false,
+			checkPushPermsExpectedCallCount: 1,
 		},
-		{"same destination image multiple times",
-			[]string{
+		{
+			description: "same destination image multiple times",
+			destinations: []string{
 				"us-central1-docker.pkg.dev/prj/test-image",
 				"us-central1-docker.pkg.dev/prj/test-image",
 			},
-			[]bool{true, false}, false,
+			checkPushPermsExpectedCallCount: 1,
+		},
+		{
+			description:                     "no push and no push cache",
+			destinations:                    []string{"us-central1-docker.pkg.dev/prj/test-image"},
+			checkPushPermsExpectedCallCount: 0,
+			noPush:                          true,
+			noPushCache:                     true,
+		},
+		{
+			description:                     "no push and push cache",
+			destinations:                    []string{"us-central1-docker.pkg.dev/prj/test-image"},
+			cacheRepo:                       "us-central1-docker.pkg.dev/prj/cache-image",
+			checkPushPermsExpectedCallCount: 1,
+			noPush:                          true,
+		},
+		{
+			description:                     "no push and cache repo is OCI image layout",
+			destinations:                    []string{"us-central1-docker.pkg.dev/prj/test-image"},
+			cacheRepo:                       "oci:/some-layout-path",
+			checkPushPermsExpectedCallCount: 0,
+			noPush:                          true,
 		},
 	}
 
-	execCommand = fakeExecCommand
 	checkRemotePushPermission = fakeCheckPushPermission
 	for _, test := range tests {
 		t.Run(test.description, func(t *testing.T) {
-			setCalledFalse()
+			resetCalledCount()
 			fs = afero.NewMemMapFs()
 			opts := config.KanikoOptions{
-				Destinations: test.Destination,
+				CacheRepo:    test.cacheRepo,
+				Destinations: test.destinations,
+				NoPush:       test.noPush,
+				NoPushCache:  test.noPushCache,
 			}
-			if test.ExistingConfig {
-				afero.WriteFile(fs, DockerConfLocation(), []byte(""), os.FileMode(0644))
-				defer fs.Remove(DockerConfLocation())
+			if test.existingConfig {
+				afero.WriteFile(fs, util.DockerConfLocation(), []byte(""), os.FileMode(0644))
+				defer fs.Remove(util.DockerConfLocation())
 			}
 			CheckPushPermissions(&opts)
-			for i, shdCall := range test.ShouldCallExecCommand {
-				if i < len(calledExecCommand) && shdCall != calledExecCommand[i] {
-					t.Errorf("Expected calledExecCommand to be %v however it was %v",
-						calledExecCommand, shdCall)
-				}
+			if checkPushPermsCallCount != test.checkPushPermsExpectedCallCount {
+				t.Errorf("expected check push permissions call count to be %d but it was %d", test.checkPushPermsExpectedCallCount, checkPushPermsCallCount)
 			}
 		})
 	}
@@ -452,4 +356,22 @@ func TestHelperProcess(t *testing.T) {
 	}
 	fmt.Fprintf(os.Stdout, "fake result")
 	os.Exit(0)
+}
+
+func TestWriteDigestFile(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	t.Run("parent directory does not exist", func(t *testing.T) {
+		err := writeDigestFile(tmpDir+"/test/df", []byte("test"))
+		if err != nil {
+			t.Errorf("expected file to be written successfully, but got error: %v", err)
+		}
+	})
+
+	t.Run("parent directory exists", func(t *testing.T) {
+		err := writeDigestFile(tmpDir+"/df", []byte("test"))
+		if err != nil {
+			t.Errorf("expected file to be written successfully, but got error: %v", err)
+		}
+	})
 }
