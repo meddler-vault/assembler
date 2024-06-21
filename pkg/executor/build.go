@@ -35,6 +35,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
+	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/moby/buildkit/frontend/dockerfile/instructions"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -104,7 +105,7 @@ func newStageBuilder(args *dockerfile.BuildArgs, opts *config.KanikoOptions, sta
 		return nil, err
 	}
 
-	err = util.InitIgnoreList(true)
+	err = util.InitIgnoreList()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to initialize ignore list")
 	}
@@ -201,29 +202,26 @@ func isOCILayout(path string) bool {
 	return strings.HasPrefix(path, "oci:")
 }
 
-func (s *stageBuilder) populateCompositeKey(command fmt.Stringer, files []string, compositeKey CompositeCache, args *dockerfile.BuildArgs, env []string) (CompositeCache, error) {
+func (s *stageBuilder) populateCompositeKey(command commands.DockerCommand, files []string, compositeKey CompositeCache, args *dockerfile.BuildArgs, env []string) (CompositeCache, error) {
 	// First replace all the environment variables or args in the command
 	replacementEnvs := args.ReplacementEnvs(env)
 	// The sort order of `replacementEnvs` is basically undefined, sort it
 	// so we can ensure a stable cache key.
 	sort.Strings(replacementEnvs)
-	resolvedCmd, err := util.ResolveEnvironmentReplacement(command.String(), replacementEnvs, false)
-	if err != nil {
-		return compositeKey, err
-	}
 	// Use the special argument "|#" at the start of the args array. This will
 	// avoid conflicts with any RUN command since commands can not
 	// start with | (vertical bar). The "#" (number of build envs) is there to
 	// help ensure proper cache matches.
-	if len(replacementEnvs) > 0 {
-		compositeKey.AddKey(fmt.Sprintf("|%d", len(replacementEnvs)))
-		compositeKey.AddKey(replacementEnvs...)
+
+	if command.IsArgsEnvsRequiredInCache() {
+		if len(replacementEnvs) > 0 {
+			compositeKey.AddKey(fmt.Sprintf("|%d", len(replacementEnvs)))
+			compositeKey.AddKey(replacementEnvs...)
+		}
 	}
+
 	// Add the next command to the cache key.
-	compositeKey.AddKey(resolvedCmd)
-	if copyCmd, ok := commands.CastAbstractCopyCommand(command); ok == true {
-		compositeKey = s.populateCopyCmdCompositeKey(command, copyCmd.From(), compositeKey)
-	}
+	compositeKey.AddKey(command.String())
 
 	for _, f := range files {
 		if err := compositeKey.AddPath(f, s.fileContext); err != nil {
@@ -231,22 +229,6 @@ func (s *stageBuilder) populateCompositeKey(command fmt.Stringer, files []string
 		}
 	}
 	return compositeKey, nil
-}
-
-func (s *stageBuilder) populateCopyCmdCompositeKey(command fmt.Stringer, from string, compositeKey CompositeCache) CompositeCache {
-	if from != "" {
-		digest, ok := s.stageIdxToDigest[from]
-		if ok {
-			ds := digest
-			cacheKey, ok := s.digestToCacheKey[ds]
-			if ok {
-				logrus.Debugf("Adding digest %v from previous stage to composite key for %v", ds, command.String())
-				compositeKey.AddKey(cacheKey)
-			}
-		}
-	}
-
-	return compositeKey
 }
 
 func (s *stageBuilder) optimize(compositeKey CompositeCache, cfg v1.Config) error {
@@ -362,7 +344,7 @@ func (s *stageBuilder) build() error {
 	}
 
 	initSnapshotTaken := false
-	if s.opts.SingleSnapshot || s.opts.RunV2 {
+	if s.opts.SingleSnapshot {
 		if err := s.initSnapshotWithTimings(); err != nil {
 			return err
 		}
@@ -519,20 +501,122 @@ func (s *stageBuilder) saveSnapshotToLayer(tarPath string) (v1.Layer, error) {
 		return nil, nil
 	}
 
-	var layer v1.Layer
-	if s.opts.CompressedCaching == true {
-		layer, err = tarball.LayerFromFile(tarPath, tarball.WithCompressedCaching)
-	} else {
-		layer, err = tarball.LayerFromFile(tarPath)
+	layerOpts := s.getLayerOptionFromOpts()
+	imageMediaType, err := s.image.MediaType()
+	if err != nil {
+		return nil, err
 	}
+	// Only appending MediaType for OCI images as the default is docker
+	if extractMediaTypeVendor(imageMediaType) == types.OCIVendorPrefix {
+		if s.opts.Compression == config.ZStd {
+			layerOpts = append(layerOpts, tarball.WithCompression("zstd"), tarball.WithMediaType(types.OCILayerZStd))
+		} else {
+			layerOpts = append(layerOpts, tarball.WithMediaType(types.OCILayer))
+		}
+	}
+
+	layer, err := tarball.LayerFromFile(tarPath, layerOpts...)
 	if err != nil {
 		return nil, err
 	}
 
 	return layer, nil
 }
+
+func (s *stageBuilder) getLayerOptionFromOpts() []tarball.LayerOption {
+	var layerOpts []tarball.LayerOption
+
+	if s.opts.CompressedCaching {
+		layerOpts = append(layerOpts, tarball.WithCompressedCaching)
+	}
+
+	if s.opts.CompressionLevel > 0 {
+		layerOpts = append(layerOpts, tarball.WithCompressionLevel(s.opts.CompressionLevel))
+	}
+	return layerOpts
+}
+
+func extractMediaTypeVendor(mt types.MediaType) string {
+	if strings.Contains(string(mt), types.OCIVendorPrefix) {
+		return types.OCIVendorPrefix
+	}
+	return types.DockerVendorPrefix
+}
+
+// https://github.com/opencontainers/image-spec/blob/main/media-types.md#compatibility-matrix
+func convertMediaType(mt types.MediaType) types.MediaType {
+	switch mt {
+	case types.DockerManifestSchema1, types.DockerManifestSchema2:
+		return types.OCIManifestSchema1
+	case types.DockerManifestList:
+		return types.OCIImageIndex
+	case types.DockerLayer:
+		return types.OCILayer
+	case types.DockerConfigJSON:
+		return types.OCIConfigJSON
+	case types.DockerForeignLayer:
+		return types.OCIUncompressedRestrictedLayer
+	case types.DockerUncompressedLayer:
+		return types.OCIUncompressedLayer
+	case types.OCIImageIndex:
+		return types.DockerManifestList
+	case types.OCIManifestSchema1:
+		return types.DockerManifestSchema2
+	case types.OCIConfigJSON:
+		return types.DockerConfigJSON
+	case types.OCILayer, types.OCILayerZStd:
+		return types.DockerLayer
+	case types.OCIRestrictedLayer:
+		return types.DockerForeignLayer
+	case types.OCIUncompressedLayer:
+		return types.DockerUncompressedLayer
+	case types.OCIContentDescriptor, types.OCIUncompressedRestrictedLayer, types.DockerManifestSchema1Signed, types.DockerPluginConfig:
+		return ""
+	default:
+		return ""
+	}
+}
+
+func (s *stageBuilder) convertLayerMediaType(layer v1.Layer) (v1.Layer, error) {
+	layerMediaType, err := layer.MediaType()
+	if err != nil {
+		return nil, err
+	}
+	imageMediaType, err := s.image.MediaType()
+	if err != nil {
+		return nil, err
+	}
+	if extractMediaTypeVendor(layerMediaType) != extractMediaTypeVendor(imageMediaType) {
+		layerOpts := s.getLayerOptionFromOpts()
+		targetMediaType := convertMediaType(layerMediaType)
+
+		if extractMediaTypeVendor(imageMediaType) == types.OCIVendorPrefix {
+			if s.opts.Compression == config.ZStd {
+				targetMediaType = types.OCILayerZStd
+				layerOpts = append(layerOpts, tarball.WithCompression("zstd"))
+			}
+		}
+
+		layerOpts = append(layerOpts, tarball.WithMediaType(targetMediaType))
+
+		if targetMediaType != "" {
+			return tarball.LayerFromOpener(layer.Uncompressed, layerOpts...)
+		}
+		return nil, fmt.Errorf(
+			"layer with media type %v cannot be converted to a media type that matches %v",
+			layerMediaType,
+			imageMediaType,
+		)
+	}
+	return layer, nil
+}
+
 func (s *stageBuilder) saveLayerToImage(layer v1.Layer, createdBy string) error {
 	var err error
+	layer, err = s.convertLayerMediaType(layer)
+	if err != nil {
+		return err
+	}
 	s.image, err = mutate.Append(s.image,
 		mutate.Addendum{
 			Layer: layer,
@@ -579,11 +663,11 @@ func CalculateDependencies(stages []config.KanikoStage, opts *config.KanikoOptio
 					if err != nil {
 						continue
 					}
-					resolved, err := util.ResolveEnvironmentReplacementList(cmd.SourcesAndDest, ba.ReplacementEnvs(cfg.Config.Env), true)
+					resolved, err := util.ResolveEnvironmentReplacementList(cmd.SourcesAndDest.SourcePaths, ba.ReplacementEnvs(cfg.Config.Env), true)
 					if err != nil {
 						return nil, err
 					}
-					depGraph[i] = append(depGraph[i], resolved[0:len(resolved)-1]...)
+					depGraph[i] = append(depGraph[i], resolved...)
 				}
 			case *instructions.EnvCommand:
 				if err := util.UpdateConfigEnv(cmd.Env, &cfg.Config, ba.ReplacementEnvs(cfg.Config.Env)); err != nil {
@@ -819,7 +903,6 @@ func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
 		if err != nil {
 			return nil, err
 		}
-
 		stageIdxToDigest[fmt.Sprintf("%d", sb.stage.Index)] = d.String()
 		logrus.Debugf("Mapping stage idx %v to digest %v", sb.stage.Index, d.String())
 
@@ -898,7 +981,7 @@ func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
 	return nil, err
 }
 
-// fileToSave returns all the files matching the given pattern in deps.
+// filesToSave returns all the files matching the given pattern in deps.
 // If a file is a symlink, it also returns the target file.
 func filesToSave(deps []string) ([]string, error) {
 	srcFiles := []string{}
@@ -923,15 +1006,51 @@ func filesToSave(deps []string) ([]string, error) {
 		}
 	}
 	// remove duplicates
+	deduped := deduplicatePaths(srcFiles)
+
+	return deduped, nil
+}
+
+// deduplicatePaths returns a deduplicated slice of shortest paths
+// For example {"usr/lib", "usr/lib/ssl"} will return only {"usr/lib"}
+func deduplicatePaths(paths []string) []string {
+	type node struct {
+		children map[string]*node
+		value    bool
+	}
+
+	root := &node{children: make(map[string]*node)}
+
+	// Create a tree marking all present paths
+	for _, f := range paths {
+		parts := strings.Split(f, "/")
+		current := root
+		for i := 0; i < len(parts)-1; i++ {
+			part := parts[i]
+			if _, ok := current.children[part]; !ok {
+				current.children[part] = &node{children: make(map[string]*node)}
+			}
+			current = current.children[part]
+		}
+		current.children[parts[len(parts)-1]] = &node{children: make(map[string]*node), value: true}
+	}
+
+	// Collect all paths
 	deduped := []string{}
-	m := map[string]struct{}{}
-	for _, f := range srcFiles {
-		if _, ok := m[f]; !ok {
-			deduped = append(deduped, f)
-			m[f] = struct{}{}
+	var traverse func(*node, string)
+	traverse = func(n *node, path string) {
+		if n.value {
+			deduped = append(deduped, strings.TrimPrefix(path, "/"))
+			return
+		}
+		for k, v := range n.children {
+			traverse(v, path+"/"+k)
 		}
 	}
-	return deduped, nil
+
+	traverse(root, "")
+
+	return deduped
 }
 
 func fetchExtraStages(stages []config.KanikoStage, opts *config.KanikoOptions) error {

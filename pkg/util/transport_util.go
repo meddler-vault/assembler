@@ -19,8 +19,10 @@ package util
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
+	"os"
+	"strings"
 
-	"io/ioutil"
 	"net/http"
 
 	"github.com/GoogleContainerTools/kaniko/pkg/config"
@@ -41,7 +43,7 @@ func (p *X509CertPool) value() *x509.CertPool {
 }
 
 func (p *X509CertPool) append(path string) error {
-	pem, err := ioutil.ReadFile(path)
+	pem, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
@@ -50,6 +52,19 @@ func (p *X509CertPool) append(path string) error {
 }
 
 var systemCertLoader CertPool
+
+type KeyPairLoader interface {
+	load(string, string) (tls.Certificate, error)
+}
+
+type X509KeyPairLoader struct {
+}
+
+func (p *X509KeyPairLoader) load(certFile, keyFile string) (tls.Certificate, error) {
+	return tls.LoadX509KeyPair(certFile, keyFile)
+}
+
+var systemKeyPairLoader KeyPairLoader
 
 func init() {
 	systemCertPool, err := x509.SystemCertPool()
@@ -60,9 +75,11 @@ func init() {
 	systemCertLoader = &X509CertPool{
 		inner: *systemCertPool,
 	}
+
+	systemKeyPairLoader = &X509KeyPairLoader{}
 }
 
-func MakeTransport(opts config.RegistryOptions, registryName string) http.RoundTripper {
+func MakeTransport(opts config.RegistryOptions, registryName string) (http.RoundTripper, error) {
 	// Create a transport to set our user-agent.
 	var tr http.RoundTripper = http.DefaultTransport.(*http.Transport).Clone()
 	if opts.SkipTLSVerify || opts.SkipTLSVerifyRegistries.Contains(registryName) {
@@ -71,12 +88,24 @@ func MakeTransport(opts config.RegistryOptions, registryName string) http.RoundT
 		}
 	} else if certificatePath := opts.RegistriesCertificates[registryName]; certificatePath != "" {
 		if err := systemCertLoader.append(certificatePath); err != nil {
-			logrus.WithError(err).Warnf("Failed to load certificate %s for %s\n", certificatePath, registryName)
-		} else {
-			tr.(*http.Transport).TLSClientConfig = &tls.Config{
-				RootCAs: systemCertLoader.value(),
-			}
+			return nil, fmt.Errorf("failed to load certificate %s for %s: %w", certificatePath, registryName, err)
+		}
+		tr.(*http.Transport).TLSClientConfig = &tls.Config{
+			RootCAs: systemCertLoader.value(),
 		}
 	}
-	return tr
+
+	if clientCertificatePath := opts.RegistriesClientCertificates[registryName]; clientCertificatePath != "" {
+		certFiles := strings.Split(clientCertificatePath, ",")
+		if len(certFiles) != 2 {
+			return nil, fmt.Errorf("failed to load client certificate/key '%s=%s', expected format: %s=/path/to/cert,/path/to/key", registryName, clientCertificatePath, registryName)
+		}
+		cert, err := systemKeyPairLoader.load(certFiles[0], certFiles[1])
+		if err != nil {
+			return nil, fmt.Errorf("failed to load client certificate/key '%s' for %s: %w", clientCertificatePath, registryName, err)
+		}
+		tr.(*http.Transport).TLSClientConfig.Certificates = []tls.Certificate{cert}
+	}
+
+	return tr, nil
 }

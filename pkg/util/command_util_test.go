@@ -18,6 +18,7 @@ package util
 
 import (
 	"fmt"
+	"io/fs"
 	"os/user"
 	"reflect"
 	"sort"
@@ -227,6 +228,12 @@ var urlDestFilepathTests = []struct {
 		expectedDest: "/test",
 	},
 	{
+		url:          "https://something/something.tar?foo=bar",
+		cwd:          "/cwd",
+		dest:         "/dir/",
+		expectedDest: "/dir/something.tar",
+	},
+	{
 		url:          "https://something/something",
 		cwd:          "/test",
 		dest:         "/dest/",
@@ -302,7 +309,8 @@ var updateConfigEnvTests = []struct {
 			{
 				Key:   "foo",
 				Value: "baz",
-			}},
+			},
+		},
 		config:          &v1.Config{},
 		replacementEnvs: []string{},
 		expectedEnv:     []string{"key=var", "foo=baz"},
@@ -320,7 +328,8 @@ var updateConfigEnvTests = []struct {
 			{
 				Key:   "foo",
 				Value: "$argarg",
-			}},
+			},
+		},
 		config:          &v1.Config{},
 		replacementEnvs: []string{"var=/test/with'chars'/", "not=used", "argarg=\"a\"b\""},
 		expectedEnv:     []string{"key=/var/run", "env=/test/with'chars'/", "foo=\"a\"b\""},
@@ -334,7 +343,8 @@ var updateConfigEnvTests = []struct {
 			{
 				Key:   "bob",
 				Value: "cool",
-			}},
+			},
+		},
 		config:          &v1.Config{Env: []string{"bob=used", "more=test"}},
 		replacementEnvs: []string{},
 		expectedEnv:     []string{"bob=cool", "more=test", "alice=nice"},
@@ -479,7 +489,16 @@ var isSrcValidTests = []struct {
 			"ignore/baz",
 			"ignore/bar",
 		},
-		shouldErr: true,
+		shouldErr: false,
+	},
+	{
+		name: "copy two srcs, wildcard and no file match, to file",
+		srcsAndDest: []string{
+			"ignore/ba[s]",
+			"dest",
+		},
+		resolvedSources: []string{},
+		shouldErr:       false,
 	},
 }
 
@@ -490,7 +509,7 @@ func Test_IsSrcsValid(t *testing.T) {
 			if err != nil {
 				t.Fatalf("error creating file context: %v", err)
 			}
-			err = IsSrcsValid(test.srcsAndDest, test.resolvedSources, fileContext)
+			err = IsSrcsValid(instructions.SourcesAndDest{SourcePaths: test.srcsAndDest[0 : len(test.srcsAndDest)-1], DestPath: test.srcsAndDest[len(test.srcsAndDest)-1]}, test.resolvedSources, fileContext)
 			testutil.CheckError(t, test.shouldErr, err)
 		})
 	}
@@ -521,44 +540,12 @@ func Test_ResolveSources(t *testing.T) {
 	}
 }
 
-var testRemoteUrls = []struct {
-	name  string
-	url   string
-	valid bool
-}{
-	{
-		name:  "Valid URL",
-		url:   "https://google.com",
-		valid: true,
-	},
-	{
-		name:  "Invalid URL",
-		url:   "not/real/",
-		valid: false,
-	},
-	{
-		name:  "URL which fails on GET",
-		url:   "https://thereisnowaythiswilleverbearealurlrightrightrightcatsarethebest.com/something/not/real",
-		valid: false,
-	},
-}
-
-func Test_RemoteUrls(t *testing.T) {
-	for _, test := range testRemoteUrls {
-		t.Run(test.name, func(t *testing.T) {
-			valid := IsSrcRemoteFileURL(test.url)
-			testutil.CheckErrorAndDeepEqual(t, false, nil, test.valid, valid)
-		})
-	}
-
-}
-
 func TestGetUserGroup(t *testing.T) {
 	tests := []struct {
 		description  string
 		chown        string
 		env          []string
-		mockIDGetter func(userStr string, groupStr string, fallbackToUID bool) (uint32, uint32, error)
+		mockIDGetter func(userStr string, groupStr string) (uint32, uint32, error)
 		// needed, in case uid is a valid number, but group is a name
 		mockGroupIDGetter func(groupStr string) (*user.Group, error)
 		expectedU         int64
@@ -569,7 +556,7 @@ func TestGetUserGroup(t *testing.T) {
 			description: "non empty chown",
 			chown:       "some:some",
 			env:         []string{},
-			mockIDGetter: func(string, string, bool) (uint32, uint32, error) {
+			mockIDGetter: func(string, string) (uint32, uint32, error) {
 				return 100, 1000, nil
 			},
 			expectedU: 100,
@@ -579,7 +566,7 @@ func TestGetUserGroup(t *testing.T) {
 			description: "non empty chown with env replacement",
 			chown:       "some:$foo",
 			env:         []string{"foo=key"},
-			mockIDGetter: func(userStr string, groupStr string, fallbackToUID bool) (uint32, uint32, error) {
+			mockIDGetter: func(userStr string, groupStr string) (uint32, uint32, error) {
 				if userStr == "some" && groupStr == "key" {
 					return 10, 100, nil
 				}
@@ -590,7 +577,7 @@ func TestGetUserGroup(t *testing.T) {
 		},
 		{
 			description: "empty chown string",
-			mockIDGetter: func(string, string, bool) (uint32, uint32, error) {
+			mockIDGetter: func(string, string) (uint32, uint32, error) {
 				return 0, 0, fmt.Errorf("should not be called")
 			},
 			expectedU: -1,
@@ -607,6 +594,43 @@ func TestGetUserGroup(t *testing.T) {
 			uid, gid, err := GetUserGroup(tc.chown, tc.env)
 			testutil.CheckErrorAndDeepEqual(t, tc.shdErr, err, uid, tc.expectedU)
 			testutil.CheckErrorAndDeepEqual(t, tc.shdErr, err, gid, tc.expectedG)
+		})
+	}
+}
+
+func TestGetChmod(t *testing.T) {
+	tests := []struct {
+		description string
+		chmod       string
+		env         []string
+		expected    fs.FileMode
+		shdErr      bool
+	}{
+		{
+			description: "non empty chmod",
+			chmod:       "0755",
+			env:         []string{},
+			expected:    fs.FileMode(0o755),
+		},
+		{
+			description: "non empty chmod with env replacement",
+			chmod:       "$foo",
+			env:         []string{"foo=0750"},
+			expected:    fs.FileMode(0o750),
+		},
+		{
+			description: "empty chmod string",
+			expected:    fs.FileMode(0o600),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.description, func(t *testing.T) {
+			defaultChmod := fs.FileMode(0o600)
+			chmod, useDefault, err := GetChmod(tc.chmod, tc.env)
+			if useDefault {
+				chmod = defaultChmod
+			}
+			testutil.CheckErrorAndDeepEqual(t, tc.shdErr, err, tc.expected, chmod)
 		})
 	}
 }
@@ -670,8 +694,7 @@ func Test_GetUIDAndGIDFromString(t *testing.T) {
 	currentUser := testutil.GetCurrentUser(t)
 
 	type args struct {
-		userGroupStr  string
-		fallbackToUID bool
+		userGroupStr string
 	}
 
 	type expected struct {
@@ -737,18 +760,7 @@ func Test_GetUIDAndGIDFromString(t *testing.T) {
 			},
 			expected: expected{
 				userID:  1001,
-				groupID: uint32(currentUserGID),
-			},
-		},
-		{
-			testname: "uid and non existing group-name with fallbackToUID",
-			args: args{
-				userGroupStr:  fmt.Sprintf("%d:%s", 1001, "hello-world-group"),
-				fallbackToUID: true,
-			},
-			expected: expected{
-				userID:  1001,
-				groupID: 1001,
+				groupID: expectedCurrentUser.groupID,
 			},
 		},
 		{
@@ -769,18 +781,9 @@ func Test_GetUIDAndGIDFromString(t *testing.T) {
 			},
 		},
 		{
-			testname: "only uid and fallback is false",
+			testname: "only uid",
 			args: args{
-				userGroupStr:  fmt.Sprintf("%d", currentUserUID),
-				fallbackToUID: false,
-			},
-			wantErr: true,
-		},
-		{
-			testname: "only uid and fallback is true",
-			args: args{
-				userGroupStr:  fmt.Sprintf("%d", currentUserUID),
-				fallbackToUID: true,
+				userGroupStr: fmt.Sprintf("%d", currentUserUID),
 			},
 			expected: expected{
 				userID:  expectedCurrentUser.userID,
@@ -796,7 +799,7 @@ func Test_GetUIDAndGIDFromString(t *testing.T) {
 		},
 	}
 	for _, tt := range testCases {
-		uid, gid, err := getUIDAndGIDFromString(tt.args.userGroupStr, tt.args.fallbackToUID)
+		uid, gid, err := getUIDAndGIDFromString(tt.args.userGroupStr)
 		testutil.CheckError(t, tt.wantErr, err)
 		if uid != tt.expected.userID || gid != tt.expected.groupID {
 			t.Errorf("%v failed. Could not correctly decode %s to uid/gid %d:%d. Result: %d:%d",
@@ -853,5 +856,45 @@ func TestLookupUser(t *testing.T) {
 			testutil.CheckErrorAndDeepEqual(t, tt.wantErr, err, tt.expected, got)
 		})
 	}
+}
 
+func TestIsSrcRemoteFileURL(t *testing.T) {
+	type args struct {
+		rawurl string
+	}
+	tests := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{
+			name: "valid https url",
+			args: args{rawurl: "https://google.com?foo=bar"},
+			want: true,
+		},
+		{
+			name: "valid http url",
+			args: args{rawurl: "http://example.com/foobar.tar.gz"},
+			want: true,
+		},
+		{
+			name: "invalid url",
+			args: args{rawurl: "http:/not-a-url.com"},
+			want: false,
+		},
+		{
+			name: "invalid url filepath",
+			args: args{rawurl: "/is/a/filepath"},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(
+			tt.name, func(t *testing.T) {
+				if got := IsSrcRemoteFileURL(tt.args.rawurl); got != tt.want {
+					t.Errorf("IsSrcRemoteFileURL() = %v, want %v", got, tt.want)
+				}
+			},
+		)
+	}
 }

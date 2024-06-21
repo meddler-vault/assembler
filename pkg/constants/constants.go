@@ -20,7 +20,7 @@ const (
 	// RootDir is the path to the root directory
 	RootDir = "/"
 
-	IgnoreListPath = "/proc/self/mountinfo"
+	MountInfoPath = "/proc/self/mountinfo"
 
 	DefaultKanikoPath = "/kaniko"
 
@@ -49,8 +49,8 @@ const (
 	RootUser         = "root"
 
 	// Docker command names
-	Cmd        = "cmd"
-	Entrypoint = "entrypoint"
+	Cmd        = "CMD"
+	Entrypoint = "ENTRYPOINT"
 
 	// Name of the .dockerignore file
 	Dockerignore = ".dockerignore"

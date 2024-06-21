@@ -20,7 +20,6 @@ import (
 	"archive/tar"
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -40,6 +39,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/partial"
+	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/moby/buildkit/frontend/dockerfile/instructions"
 )
 
@@ -369,8 +369,8 @@ COPY --from=second /bar /bat
 				initializeConfig = tt.args.mockInitConfig
 			}
 
-			f, _ := ioutil.TempFile("", "")
-			ioutil.WriteFile(f.Name(), []byte(tt.args.dockerfile), 0755)
+			f, _ := os.CreateTemp("", "")
+			os.WriteFile(f.Name(), []byte(tt.args.dockerfile), 0755)
 			opts := &config.KanikoOptions{
 				DockerfilePath: f.Name(),
 				CustomPlatform: platforms.Format(platforms.Normalize(platforms.DefaultSpec())),
@@ -463,6 +463,41 @@ func Test_filesToSave(t *testing.T) {
 			sort.Strings(got)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("filesToSave() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDeduplicatePaths(t *testing.T) {
+	tests := []struct {
+		name  string
+		input []string
+		want  []string
+	}{
+		{
+			name:  "no duplicates",
+			input: []string{"file1.txt", "file2.txt", "usr/lib"},
+			want:  []string{"file1.txt", "file2.txt", "usr/lib"},
+		},
+		{
+			name:  "duplicates",
+			input: []string{"file1.txt", "file2.txt", "file2.txt", "usr/lib"},
+			want:  []string{"file1.txt", "file2.txt", "usr/lib"},
+		},
+		{
+			name:  "duplicates with paths",
+			input: []string{"file1.txt", "file2.txt", "file2.txt", "usr/lib", "usr/lib/ssl"},
+			want:  []string{"file1.txt", "file2.txt", "usr/lib"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := deduplicatePaths(tt.input)
+			sort.Strings(tt.want)
+			sort.Strings(got)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("TestDeduplicatePaths() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -581,12 +616,12 @@ func Test_stageBuilder_optimize(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			cf := &v1.ConfigFile{}
-			snap := fakeSnapShotter{}
+			snap := &fakeSnapShotter{}
 			lc := &fakeLayerCache{retrieve: tc.retrieve}
 			sb := &stageBuilder{opts: tc.opts, cf: cf, snapshotter: snap, layerCache: lc,
 				args: dockerfile.NewBuildArgs([]string{})}
 			ck := CompositeCache{}
-			file, err := ioutil.TempFile("", "foo")
+			file, err := os.CreateTemp("", "foo")
 			if err != nil {
 				t.Error(err)
 			}
@@ -619,14 +654,15 @@ func newStageContext(command string, args map[string]string, env []string) stage
 }
 
 func Test_stageBuilder_populateCompositeKey(t *testing.T) {
-	testCases := []struct {
+	type testcase struct {
 		description string
 		cmd1        stageContext
 		cmd2        stageContext
 		shdEqual    bool
-	}{
+	}
+	testCases := []testcase{
 		{
-			description: "cache key for same command with same build args",
+			description: "cache key for same command [RUN] with same build args",
 			cmd1: newStageContext(
 				"RUN echo $ARG > test",
 				map[string]string{"ARG": "foo"},
@@ -640,7 +676,7 @@ func Test_stageBuilder_populateCompositeKey(t *testing.T) {
 			shdEqual: true,
 		},
 		{
-			description: "cache key for same command with same env and args",
+			description: "cache key for same command [RUN] with same env and args",
 			cmd1: newStageContext(
 				"RUN echo $ENV > test",
 				map[string]string{"ARG": "foo"},
@@ -654,7 +690,7 @@ func Test_stageBuilder_populateCompositeKey(t *testing.T) {
 			shdEqual: true,
 		},
 		{
-			description: "cache key for same command with same env but different args",
+			description: "cache key for same command [RUN] with same env but different args",
 			cmd1: newStageContext(
 				"RUN echo $ENV > test",
 				map[string]string{"ARG": "foo"},
@@ -667,7 +703,7 @@ func Test_stageBuilder_populateCompositeKey(t *testing.T) {
 			),
 		},
 		{
-			description: "cache key for same command, different buildargs, args not used in command",
+			description: "cache key for same command [RUN], different buildargs, args not used in command",
 			cmd1: newStageContext(
 				"RUN echo const > test",
 				map[string]string{"ARG": "foo"},
@@ -680,7 +716,7 @@ func Test_stageBuilder_populateCompositeKey(t *testing.T) {
 			),
 		},
 		{
-			description: "cache key for same command, different buildargs, args used in script",
+			description: "cache key for same command [RUN], different buildargs, args used in script",
 			// test.sh
 			// #!/bin/sh
 			// echo ${ARG}
@@ -696,7 +732,7 @@ func Test_stageBuilder_populateCompositeKey(t *testing.T) {
 			),
 		},
 		{
-			description: "cache key for same command with a build arg values",
+			description: "cache key for same command [RUN] with a build arg values",
 			cmd1: newStageContext(
 				"RUN echo $ARG > test",
 				map[string]string{"ARG": "foo"},
@@ -709,7 +745,7 @@ func Test_stageBuilder_populateCompositeKey(t *testing.T) {
 			),
 		},
 		{
-			description: "cache key for same command with different env values",
+			description: "cache key for same command [RUN] with different env values",
 			cmd1: newStageContext(
 				"RUN echo $ENV > test",
 				map[string]string{"ARG": "foo"},
@@ -722,7 +758,7 @@ func Test_stageBuilder_populateCompositeKey(t *testing.T) {
 			),
 		},
 		{
-			description: "cache key for different command same context",
+			description: "cache key for different command [RUN] same context",
 			cmd1: newStageContext(
 				"RUN echo other > test",
 				map[string]string{"ARG": "foo"},
@@ -734,17 +770,133 @@ func Test_stageBuilder_populateCompositeKey(t *testing.T) {
 				[]string{"ENV=1"},
 			),
 		},
+		{
+			description: "cache key for command [RUN] with same env values [check that variable no interpolate in RUN command]",
+			cmd1: newStageContext(
+				"RUN echo $ENV > test",
+				map[string]string{"ARG": "foo"},
+				[]string{"ENV=1"},
+			),
+			cmd2: newStageContext(
+				"RUN echo 1 > test",
+				map[string]string{"ARG": "foo"},
+				[]string{"ENV=1"},
+			),
+			shdEqual: false,
+		},
+		{
+			description: "cache key for command [RUN] with different env values [check that variable no interpolate in RUN command]",
+			cmd1: newStageContext(
+				"RUN echo ${APP_VERSION%.*} ${APP_VERSION%-*} > test",
+				map[string]string{"ARG": "foo"},
+				[]string{"ENV=1"},
+			),
+			cmd2: newStageContext(
+				"RUN echo ${APP_VERSION%.*} ${APP_VERSION%-*} > test",
+				map[string]string{"ARG": "foo"},
+				[]string{"ENV=2"},
+			),
+			shdEqual: false,
+		},
+		func() testcase {
+			dir, files := tempDirAndFile(t)
+			file := files[0]
+			filePath := filepath.Join(dir, file)
+			return testcase{
+				description: "cache key for same command [COPY] with same args",
+				cmd1: newStageContext(
+					fmt.Sprintf("COPY %s /meow", filePath),
+					map[string]string{"ARG": "foo"},
+					[]string{"ENV=1"},
+				),
+				cmd2: newStageContext(
+					fmt.Sprintf("COPY %s /meow", filePath),
+					map[string]string{"ARG": "foo"},
+					[]string{"ENV=1"},
+				),
+				shdEqual: true,
+			}
+		}(),
+		func() testcase {
+			dir, files := tempDirAndFile(t)
+			file := files[0]
+			filePath := filepath.Join(dir, file)
+			return testcase{
+				description: "cache key for same command [COPY] with different args",
+				cmd1: newStageContext(
+					fmt.Sprintf("COPY %s /meow", filePath),
+					map[string]string{"ARG": "foo"},
+					[]string{"ENV=1"},
+				),
+				cmd2: newStageContext(
+					fmt.Sprintf("COPY %s /meow", filePath),
+					map[string]string{"ARG": "bar"},
+					[]string{"ENV=2"},
+				),
+				shdEqual: true,
+			}
+		}(),
+		{
+			description: "cache key for same command [WORKDIR] with same args",
+			cmd1: newStageContext(
+				"WORKDIR /",
+				map[string]string{"ARG": "foo"},
+				[]string{"ENV=1"},
+			),
+			cmd2: newStageContext(
+				"WORKDIR /",
+				map[string]string{"ARG": "foo"},
+				[]string{"ENV=1"},
+			),
+			shdEqual: true,
+		},
+		{
+			description: "cache key for same command [WORKDIR] with different args",
+			cmd1: newStageContext(
+				"WORKDIR /",
+				map[string]string{"ARG": "foo"},
+				[]string{"ENV=1"},
+			),
+			cmd2: newStageContext(
+				"WORKDIR /",
+				map[string]string{"ARG": "bar"},
+				[]string{"ENV=2"},
+			),
+			shdEqual: true,
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.description, func(t *testing.T) {
 			sb := &stageBuilder{fileContext: util.FileContext{Root: "workspace"}}
 			ck := CompositeCache{}
 
-			ck1, err := sb.populateCompositeKey(tc.cmd1.command, []string{}, ck, tc.cmd1.args, tc.cmd1.env)
+			instructions1, err := dockerfile.ParseCommands([]string{tc.cmd1.command.String()})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			fc1 := util.FileContext{Root: "workspace"}
+			dockerCommand1, err := commands.GetCommand(instructions1[0], fc1, false, true, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			instructions, err := dockerfile.ParseCommands([]string{tc.cmd2.command.String()})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			fc2 := util.FileContext{Root: "workspace"}
+			dockerCommand2, err := commands.GetCommand(instructions[0], fc2, false, true, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			ck1, err := sb.populateCompositeKey(dockerCommand1, []string{}, ck, tc.cmd1.args, tc.cmd1.env)
 			if err != nil {
 				t.Errorf("Expected error to be nil but was %v", err)
 			}
-			ck2, err := sb.populateCompositeKey(tc.cmd2.command, []string{}, ck, tc.cmd2.args, tc.cmd2.env)
+			ck2, err := sb.populateCompositeKey(dockerCommand2, []string{}, ck, tc.cmd2.args, tc.cmd2.env)
 			if err != nil {
 				t.Errorf("Expected error to be nil but was %v", err)
 			}
@@ -772,6 +924,7 @@ func Test_stageBuilder_build(t *testing.T) {
 		stage              config.KanikoStage
 		crossStageDeps     map[int][]string
 		mockGetFSFromImage func(root string, img v1.Image, extract util.ExtractFunction) ([]string, error)
+		shouldInitSnapshot bool
 	}
 
 	testCases := []testcase{
@@ -872,6 +1025,15 @@ func Test_stageBuilder_build(t *testing.T) {
 			}
 		}(),
 		{
+			description: "use new run",
+			opts:        &config.KanikoOptions{RunV2: true},
+		},
+		{
+			description:        "single snapshot",
+			opts:               &config.KanikoOptions{SingleSnapshot: true},
+			shouldInitSnapshot: true,
+		},
+		{
 			description: "fake command cache disabled and key not in cache",
 			opts:        &config.KanikoOptions{Cache: false},
 		},
@@ -898,17 +1060,16 @@ func Test_stageBuilder_build(t *testing.T) {
 			}
 			copyCommandCacheKey := hash
 			dockerFile := fmt.Sprintf(`
-FROM ubuntu:16.04
-COPY %s foo.txt
-`, filename)
-			f, _ := ioutil.TempFile("", "")
-			ioutil.WriteFile(f.Name(), []byte(dockerFile), 0755)
+		FROM ubuntu:16.04
+		COPY %s foo.txt
+		`, filename)
+			f, _ := os.CreateTemp("", "")
+			os.WriteFile(f.Name(), []byte(dockerFile), 0755)
 			opts := &config.KanikoOptions{
 				DockerfilePath:  f.Name(),
 				Cache:           true,
 				CacheCopyLayers: true,
 			}
-
 			testStages, metaArgs, err := dockerfile.ParseStages(opts)
 			if err != nil {
 				t.Errorf("Failed to parse test dockerfile to stages: %s", err)
@@ -968,8 +1129,8 @@ COPY %s foo.txt
 FROM ubuntu:16.04
 COPY %s foo.txt
 `, filename)
-			f, _ := ioutil.TempFile("", "")
-			ioutil.WriteFile(f.Name(), []byte(dockerFile), 0755)
+			f, _ := os.CreateTemp("", "")
+			os.WriteFile(f.Name(), []byte(dockerFile), 0755)
 			opts := &config.KanikoOptions{
 				DockerfilePath:  f.Name(),
 				Cache:           true,
@@ -1047,8 +1208,8 @@ FROM ubuntu:16.04
 RUN foobar
 COPY %s bar.txt
 `, filename)
-			f, _ := ioutil.TempFile("", "")
-			ioutil.WriteFile(f.Name(), []byte(dockerFile), 0755)
+			f, _ := os.CreateTemp("", "")
+			os.WriteFile(f.Name(), []byte(dockerFile), 0755)
 			opts := &config.KanikoOptions{
 				DockerfilePath: f.Name(),
 			}
@@ -1100,7 +1261,7 @@ COPY %s bar.txt
 				t.Errorf("couldn't create hash %v", err)
 			}
 
-			ch.AddKey(fmt.Sprintf("RUN foobar"))
+			ch.AddKey("RUN foobar")
 
 			// run hash
 			runHash, err := ch.Hash()
@@ -1121,8 +1282,8 @@ FROM ubuntu:16.04
 COPY %s bar.txt
 RUN foobar
 `, filename)
-			f, _ := ioutil.TempFile("", "")
-			ioutil.WriteFile(f.Name(), []byte(dockerFile), 0755)
+			f, _ := os.CreateTemp("", "")
+			os.WriteFile(f.Name(), []byte(dockerFile), 0755)
 			opts := &config.KanikoOptions{
 				DockerfilePath: f.Name(),
 			}
@@ -1172,6 +1333,7 @@ RUN foobar
 				cacheCommand: MockCachedDockerCommand{
 					contextFiles: []string{},
 				},
+				argToCompositeCache: true,
 			}
 
 			return testcase{
@@ -1197,7 +1359,7 @@ RUN foobar
 			ch := NewCompositeCache("")
 			ch.AddKey("|1")
 			ch.AddKey("arg=value")
-			ch.AddKey("RUN value")
+			ch.AddKey("RUN $arg")
 			hash, err := ch.Hash()
 			if err != nil {
 				t.Errorf("couldn't create hash %v", err)
@@ -1209,6 +1371,7 @@ RUN foobar
 				cacheCommand: MockCachedDockerCommand{
 					contextFiles: []string{},
 				},
+				argToCompositeCache: true,
 			}
 
 			return testcase{
@@ -1241,7 +1404,7 @@ RUN foobar
 			ch2 := NewCompositeCache("")
 			ch2.AddKey("|1")
 			ch2.AddKey("arg=anotherValue")
-			ch2.AddKey("RUN anotherValue")
+			ch2.AddKey("RUN $arg")
 			hash2, err := ch2.Hash()
 			if err != nil {
 				t.Errorf("couldn't create hash %v", err)
@@ -1252,6 +1415,7 @@ RUN foobar
 				cacheCommand: MockCachedDockerCommand{
 					contextFiles: []string{},
 				},
+				argToCompositeCache: true,
 			}
 
 			return testcase{
@@ -1286,7 +1450,7 @@ RUN foobar
 		t.Run(tc.description, func(t *testing.T) {
 			var fileName string
 			if tc.commands == nil {
-				file, err := ioutil.TempFile("", "foo")
+				file, err := os.CreateTemp("", "foo")
 				if err != nil {
 					t.Error(err)
 				}
@@ -1311,7 +1475,7 @@ RUN foobar
 				}
 			}
 
-			snap := fakeSnapShotter{file: fileName}
+			snap := &fakeSnapShotter{file: fileName}
 			lc := tc.layerCache
 			if lc == nil {
 				lc = &fakeLayerCache{}
@@ -1348,7 +1512,11 @@ RUN foobar
 			if err != nil {
 				t.Errorf("Expected error to be nil but was %v", err)
 			}
-			fmt.Println(lc.receivedKeys)
+			if tc.shouldInitSnapshot && !snap.initialized {
+				t.Errorf("Snapshotter was not initialized but should have been")
+			} else if !tc.shouldInitSnapshot && snap.initialized {
+				t.Errorf("Snapshotter was initialized but should not have been")
+			}
 			assertCacheKeys(t, tc.expectedCacheKeys, lc.receivedKeys, "receive")
 			assertCacheKeys(t, tc.pushedCacheKeys, keys, "push")
 
@@ -1397,7 +1565,6 @@ func getCommands(fileContext util.FileContext, cmds []instructions.Command, cach
 		outCommands = append(outCommands, cmd)
 	}
 	return outCommands
-
 }
 
 func tempDirAndFile(t *testing.T) (string, []string) {
@@ -1406,7 +1573,7 @@ func tempDirAndFile(t *testing.T) (string, []string) {
 	dir := t.TempDir()
 	for _, filename := range filenames {
 		filepath := filepath.Join(dir, filename)
-		err := ioutil.WriteFile(filepath, []byte(`meow`), 0777)
+		err := os.WriteFile(filepath, []byte(`meow`), 0777)
 		if err != nil {
 			t.Errorf("could not create temp file %v", err)
 		}
@@ -1435,7 +1602,7 @@ func generateTar(t *testing.T, dir string, fileNames ...string) []byte {
 			t.Errorf("could not write tar header %v", err)
 		}
 
-		content, err := ioutil.ReadFile(filePath)
+		content, err := os.ReadFile(filePath)
 		if err != nil {
 			t.Errorf("could not read tempfile %v", err)
 		}
@@ -1468,9 +1635,10 @@ func Test_stageBuild_populateCompositeKeyForCopyCommand(t *testing.T) {
 		expectedCacheKey string
 	}{
 		{
-			description:      "multi-stage copy command",
+			description: "multi-stage copy command",
+			// dont use digest from previoust stage for COPY
 			command:          "COPY --from=0 foo.txt bar.txt",
-			expectedCacheKey: "COPY --from=0 foo.txt bar.txt-some-cache-key",
+			expectedCacheKey: "COPY --from=0 foo.txt bar.txt",
 		},
 		{
 			description:      "copy command",
@@ -1492,7 +1660,7 @@ func Test_stageBuild_populateCompositeKeyForCopyCommand(t *testing.T) {
 
 			for _, useCacheCommand := range []bool{false, true} {
 				t.Run(fmt.Sprintf("CacheCommand=%t", useCacheCommand), func(t *testing.T) {
-					var cmd fmt.Stringer = copyCommand
+					var cmd commands.DockerCommand = copyCommand
 					if useCacheCommand {
 						cmd = copyCommand.(*commands.CopyCommand).CacheCommand(nil)
 					}
@@ -1575,5 +1743,282 @@ func Test_ResolveCrossStageInstructions(t *testing.T) {
 
 		expectedMap := map[string]string{"second": "1", "third": "2"}
 		testutil.CheckDeepEqual(t, expectedMap, stageToIdx)
+	}
+}
+
+func Test_stageBuilder_saveSnapshotToLayer(t *testing.T) {
+	dir, files := tempDirAndFile(t)
+	type fields struct {
+		stage            config.KanikoStage
+		image            v1.Image
+		cf               *v1.ConfigFile
+		baseImageDigest  string
+		finalCacheKey    string
+		opts             *config.KanikoOptions
+		fileContext      util.FileContext
+		cmds             []commands.DockerCommand
+		args             *dockerfile.BuildArgs
+		crossStageDeps   map[int][]string
+		digestToCacheKey map[string]string
+		stageIdxToDigest map[string]string
+		snapshotter      snapShotter
+		layerCache       cache.LayerCache
+		pushLayerToCache cachePusher
+	}
+	type args struct {
+		tarPath string
+	}
+	tests := []struct {
+		name              string
+		fields            fields
+		args              args
+		expectedMediaType types.MediaType
+		expectedDiff      v1.Hash
+		expectedDigest    v1.Hash
+		wantErr           bool
+	}{
+		{
+			name: "oci image",
+			fields: fields{
+				image: ociFakeImage{},
+				opts: &config.KanikoOptions{
+					ForceBuildMetadata: true,
+				},
+			},
+			args: args{
+				tarPath: filepath.Join(dir, files[0]),
+			},
+			expectedMediaType: types.OCILayer,
+			expectedDiff: v1.Hash{
+				Algorithm: "sha256",
+				Hex:       "404cdd7bc109c432f8cc2443b45bcfe95980f5107215c645236e577929ac3e52",
+			},
+			expectedDigest: v1.Hash{
+				Algorithm: "sha256",
+				Hex:       "1dc5887a31ec6b388646be46c5f0b2036f92f4cbba50d12163a8be4074565a91",
+			},
+		},
+		{
+			name: "docker image",
+			fields: fields{
+				image: fakeImage{},
+				opts: &config.KanikoOptions{
+					ForceBuildMetadata: true,
+				},
+			},
+			args: args{
+				tarPath: filepath.Join(dir, files[0]),
+			},
+			expectedMediaType: types.DockerLayer,
+			expectedDiff: v1.Hash{
+				Algorithm: "sha256",
+				Hex:       "404cdd7bc109c432f8cc2443b45bcfe95980f5107215c645236e577929ac3e52",
+			},
+			expectedDigest: v1.Hash{
+				Algorithm: "sha256",
+				Hex:       "1dc5887a31ec6b388646be46c5f0b2036f92f4cbba50d12163a8be4074565a91",
+			},
+		},
+		{
+			name: "oci image, zstd compression",
+			fields: fields{
+				image: ociFakeImage{},
+				opts: &config.KanikoOptions{
+					ForceBuildMetadata: true,
+					Compression:        config.ZStd,
+				},
+			},
+			args: args{
+				tarPath: filepath.Join(dir, files[0]),
+			},
+			expectedMediaType: types.OCILayerZStd,
+			expectedDiff: v1.Hash{
+				Algorithm: "sha256",
+				Hex:       "404cdd7bc109c432f8cc2443b45bcfe95980f5107215c645236e577929ac3e52",
+			},
+			expectedDigest: v1.Hash{
+				Algorithm: "sha256",
+				Hex:       "28369c11d9b68c9877781eaf4d8faffb4d0ada1900a1fb83ad452e58a072b45b",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &stageBuilder{
+				stage:            tt.fields.stage,
+				image:            tt.fields.image,
+				cf:               tt.fields.cf,
+				baseImageDigest:  tt.fields.baseImageDigest,
+				finalCacheKey:    tt.fields.finalCacheKey,
+				opts:             tt.fields.opts,
+				fileContext:      tt.fields.fileContext,
+				cmds:             tt.fields.cmds,
+				args:             tt.fields.args,
+				crossStageDeps:   tt.fields.crossStageDeps,
+				digestToCacheKey: tt.fields.digestToCacheKey,
+				stageIdxToDigest: tt.fields.stageIdxToDigest,
+				snapshotter:      tt.fields.snapshotter,
+				layerCache:       tt.fields.layerCache,
+				pushLayerToCache: tt.fields.pushLayerToCache,
+			}
+			got, err := s.saveSnapshotToLayer(tt.args.tarPath)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("stageBuilder.saveSnapshotToLayer() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if mt, _ := got.MediaType(); mt != tt.expectedMediaType {
+				t.Errorf("expected mediatype %s, got %s", tt.expectedMediaType, mt)
+				return
+			}
+			if diff, _ := got.DiffID(); diff != tt.expectedDiff {
+				t.Errorf("expected diff %s, got %s", tt.expectedDiff, diff)
+				return
+			}
+			if digest, _ := got.Digest(); digest != tt.expectedDigest {
+				t.Errorf("expected digest %s, got %s", tt.expectedDigest, digest)
+				return
+			}
+		})
+	}
+}
+
+func Test_stageBuilder_convertLayerMediaType(t *testing.T) {
+	type fields struct {
+		stage            config.KanikoStage
+		image            v1.Image
+		cf               *v1.ConfigFile
+		baseImageDigest  string
+		finalCacheKey    string
+		opts             *config.KanikoOptions
+		fileContext      util.FileContext
+		cmds             []commands.DockerCommand
+		args             *dockerfile.BuildArgs
+		crossStageDeps   map[int][]string
+		digestToCacheKey map[string]string
+		stageIdxToDigest map[string]string
+		snapshotter      snapShotter
+		layerCache       cache.LayerCache
+		pushLayerToCache cachePusher
+	}
+	type args struct {
+		layer v1.Layer
+	}
+	tests := []struct {
+		name              string
+		fields            fields
+		args              args
+		expectedMediaType types.MediaType
+		wantErr           bool
+	}{
+		{
+			name: "docker image w/ docker layer",
+			fields: fields{
+				image: fakeImage{},
+			},
+			args: args{
+				layer: fakeLayer{
+					mediaType: types.DockerLayer,
+				},
+			},
+			expectedMediaType: types.DockerLayer,
+		},
+		{
+			name: "oci image w/ oci layer",
+			fields: fields{
+				image: ociFakeImage{},
+			},
+			args: args{
+				layer: fakeLayer{
+					mediaType: types.OCILayer,
+				},
+			},
+			expectedMediaType: types.OCILayer,
+		},
+		{
+			name: "oci image w/ convertable docker layer",
+			fields: fields{
+				image: ociFakeImage{},
+				opts:  &config.KanikoOptions{},
+			},
+			args: args{
+				layer: fakeLayer{
+					mediaType: types.DockerLayer,
+				},
+			},
+			expectedMediaType: types.OCILayer,
+		},
+		{
+			name: "oci image w/ convertable docker layer and zstd compression",
+			fields: fields{
+				image: ociFakeImage{},
+				opts: &config.KanikoOptions{
+					Compression: config.ZStd,
+				},
+			},
+			args: args{
+				layer: fakeLayer{
+					mediaType: types.DockerLayer,
+				},
+			},
+			expectedMediaType: types.OCILayerZStd,
+		},
+		{
+			name: "docker image and oci zstd layer",
+			fields: fields{
+				image: dockerFakeImage{},
+				opts:  &config.KanikoOptions{},
+			},
+			args: args{
+				layer: fakeLayer{
+					mediaType: types.OCILayerZStd,
+				},
+			},
+			expectedMediaType: types.DockerLayer,
+		},
+		{
+			name: "docker image w/ uncovertable oci image",
+			fields: fields{
+				image: dockerFakeImage{},
+				opts:  &config.KanikoOptions{},
+			},
+			args: args{
+				layer: fakeLayer{
+					mediaType: types.OCIUncompressedRestrictedLayer,
+				},
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &stageBuilder{
+				stage:            tt.fields.stage,
+				image:            tt.fields.image,
+				cf:               tt.fields.cf,
+				baseImageDigest:  tt.fields.baseImageDigest,
+				finalCacheKey:    tt.fields.finalCacheKey,
+				opts:             tt.fields.opts,
+				fileContext:      tt.fields.fileContext,
+				cmds:             tt.fields.cmds,
+				args:             tt.fields.args,
+				crossStageDeps:   tt.fields.crossStageDeps,
+				digestToCacheKey: tt.fields.digestToCacheKey,
+				stageIdxToDigest: tt.fields.stageIdxToDigest,
+				snapshotter:      tt.fields.snapshotter,
+				layerCache:       tt.fields.layerCache,
+				pushLayerToCache: tt.fields.pushLayerToCache,
+			}
+			got, err := s.convertLayerMediaType(tt.args.layer)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("stageBuilder.convertLayerMediaType() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if err == nil {
+				mt, _ := got.MediaType()
+				if mt != tt.expectedMediaType {
+					t.Errorf("stageBuilder.convertLayerMediaType() = %v, want %v", mt, tt.expectedMediaType)
+				}
+			}
+		})
 	}
 }

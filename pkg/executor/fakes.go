@@ -21,7 +21,6 @@ import (
 	"bytes"
 	"errors"
 	"io"
-	"io/ioutil"
 
 	"github.com/GoogleContainerTools/kaniko/pkg/commands"
 	"github.com/GoogleContainerTools/kaniko/pkg/dockerfile"
@@ -30,22 +29,27 @@ import (
 )
 
 type fakeSnapShotter struct {
-	file    string
-	tarPath string
+	file        string
+	tarPath     string
+	initialized bool
 }
 
-func (f fakeSnapShotter) Init() error { return nil }
-func (f fakeSnapShotter) TakeSnapshotFS() (string, error) {
+func (f *fakeSnapShotter) Init() error {
+	f.initialized = true
+	return nil
+}
+func (f *fakeSnapShotter) TakeSnapshotFS() (string, error) {
 	return f.tarPath, nil
 }
-func (f fakeSnapShotter) TakeSnapshot(_ []string, _, _ bool) (string, error) {
+func (f *fakeSnapShotter) TakeSnapshot(_ []string, _, _ bool) (string, error) {
 	return f.tarPath, nil
 }
 
 type MockDockerCommand struct {
-	command      string
-	contextFiles []string
-	cacheCommand commands.DockerCommand
+	command             string
+	contextFiles        []string
+	cacheCommand        commands.DockerCommand
+	argToCompositeCache bool
 }
 
 func (m MockDockerCommand) ExecuteCommand(c *v1.Config, args *dockerfile.BuildArgs) error { return nil }
@@ -76,9 +80,13 @@ func (m MockDockerCommand) ShouldCacheOutput() bool {
 func (m MockDockerCommand) ShouldDetectDeletedFiles() bool {
 	return false
 }
+func (m MockDockerCommand) IsArgsEnvsRequiredInCache() bool {
+	return m.argToCompositeCache
+}
 
 type MockCachedDockerCommand struct {
-	contextFiles []string
+	contextFiles        []string
+	argToCompositeCache bool
 }
 
 func (m MockCachedDockerCommand) ExecuteCommand(c *v1.Config, args *dockerfile.BuildArgs) error {
@@ -111,6 +119,9 @@ func (m MockCachedDockerCommand) RequiresUnpackedFS() bool {
 func (m MockCachedDockerCommand) ShouldCacheOutput() bool {
 	return false
 }
+func (m MockCachedDockerCommand) IsArgsEnvsRequiredInCache() bool {
+	return m.argToCompositeCache
+}
 
 type fakeLayerCache struct {
 	retrieve     bool
@@ -137,6 +148,7 @@ func (f *fakeLayerCache) RetrieveLayer(key string) (v1.Image, error) {
 
 type fakeLayer struct {
 	TarContent []byte
+	mediaType  types.MediaType
 }
 
 func (f fakeLayer) Digest() (v1.Hash, error) {
@@ -149,13 +161,13 @@ func (f fakeLayer) Compressed() (io.ReadCloser, error) {
 	return nil, nil
 }
 func (f fakeLayer) Uncompressed() (io.ReadCloser, error) {
-	return ioutil.NopCloser(bytes.NewReader(f.TarContent)), nil
+	return io.NopCloser(bytes.NewReader(f.TarContent)), nil
 }
 func (f fakeLayer) Size() (int64, error) {
 	return 0, nil
 }
 func (f fakeLayer) MediaType() (types.MediaType, error) {
-	return "", nil
+	return f.mediaType, nil
 }
 
 type fakeImage struct {
@@ -194,4 +206,20 @@ func (f fakeImage) LayerByDigest(v1.Hash) (v1.Layer, error) {
 }
 func (f fakeImage) LayerByDiffID(v1.Hash) (v1.Layer, error) {
 	return fakeLayer{}, nil
+}
+
+type ociFakeImage struct {
+	*fakeImage
+}
+
+func (f ociFakeImage) MediaType() (types.MediaType, error) {
+	return types.OCIManifestSchema1, nil
+}
+
+type dockerFakeImage struct {
+	*fakeImage
+}
+
+func (f dockerFakeImage) MediaType() (types.MediaType, error) {
+	return types.DockerManifestSchema2, nil
 }

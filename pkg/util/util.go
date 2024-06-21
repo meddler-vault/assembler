@@ -20,8 +20,8 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"os"
 	"strconv"
@@ -145,6 +145,12 @@ func RedoHasher() func(string) (string, error) {
 		if err != nil {
 			return "", err
 		}
+
+		logrus.Debugf("Hash components for file: %s, mode: %s, mtime: %s, size: %s, user-id: %s, group-id: %s",
+			p, []byte(fi.Mode().String()), []byte(fi.ModTime().String()),
+			[]byte(strconv.FormatInt(fi.Size(), 16)), []byte(strconv.FormatUint(uint64(fi.Sys().(*syscall.Stat_t).Uid), 36)),
+			[]byte(strconv.FormatUint(uint64(fi.Sys().(*syscall.Stat_t).Gid), 36)))
+
 		h.Write([]byte(fi.Mode().String()))
 		h.Write([]byte(fi.ModTime().String()))
 		h.Write([]byte(strconv.FormatInt(fi.Size(), 16)))
@@ -169,7 +175,7 @@ func SHA256(r io.Reader) (string, error) {
 
 // GetInputFrom returns Reader content
 func GetInputFrom(r io.Reader) ([]byte, error) {
-	output, err := ioutil.ReadAll(r)
+	output, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}
@@ -189,6 +195,26 @@ func Retry(operation retryFunc, retryCount int, initialDelayMilliseconds int) er
 	}
 
 	return err
+}
+
+// Retry retries an operation with a return value
+func RetryWithResult[T any](operation func() (T, error), retryCount int, initialDelayMilliseconds int) (result T, err error) {
+	result, err = operation()
+	if err == nil {
+		return result, nil
+	}
+	for i := 0; i < retryCount; i++ {
+		sleepDuration := time.Millisecond * time.Duration(int(math.Pow(2, float64(i)))*initialDelayMilliseconds)
+		logrus.Warnf("Retrying operation after %s due to %v", sleepDuration, err)
+		time.Sleep(sleepDuration)
+
+		result, err = operation()
+		if err == nil {
+			return result, nil
+		}
+	}
+
+	return result, fmt.Errorf("unable to complete operation after %d attempts, last error: %w", retryCount, err)
 }
 
 func Lgetxattr(path string, attr string) ([]byte, error) {

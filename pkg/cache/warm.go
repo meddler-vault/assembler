@@ -17,14 +17,17 @@ limitations under the License.
 package cache
 
 import (
-	"bytes"
+	"fmt"
 	"io"
-	"io/ioutil"
+	"net/http"
 	"os"
 	"path"
+	"regexp"
 
 	"github.com/GoogleContainerTools/kaniko/pkg/config"
+	"github.com/GoogleContainerTools/kaniko/pkg/dockerfile"
 	"github.com/GoogleContainerTools/kaniko/pkg/image/remote"
+	"github.com/GoogleContainerTools/kaniko/pkg/util"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
@@ -34,42 +37,31 @@ import (
 
 // WarmCache populates the cache
 func WarmCache(opts *config.WarmerOptions) error {
+	var dockerfileImages []string
 	cacheDir := opts.CacheDir
 	images := opts.Images
+
+	// if opts.image is empty,we need to parse dockerfilepath to get images list
+	if opts.DockerfilePath != "" {
+		var err error
+		if dockerfileImages, err = ParseDockerfile(opts); err != nil {
+			return errors.Wrap(err, "failed to parse Dockerfile")
+		}
+	}
+
+	// TODO: Implement deduplication logic later.
+	images = append(images, dockerfileImages...)
+
 	logrus.Debugf("%s\n", cacheDir)
 	logrus.Debugf("%s\n", images)
 
 	errs := 0
 	for _, img := range images {
-		tarBuf := new(bytes.Buffer)
-		manifestBuf := new(bytes.Buffer)
-
-		cw := &Warmer{
-			Remote:         remote.RetrieveRemoteImage,
-			Local:          LocalSource,
-			TarWriter:      tarBuf,
-			ManifestWriter: manifestBuf,
-		}
-
-		digest, err := cw.Warm(img, opts)
+		err := warmToFile(cacheDir, img, opts)
 		if err != nil {
-			if !IsAlreadyCached(err) {
-				logrus.Warnf("Error while trying to warm image: %v %v", img, err)
-				errs++
-			}
-
-			continue
-		}
-
-		cachePath := path.Join(cacheDir, digest.String())
-
-		if err := writeBufsToFile(cachePath, tarBuf, manifestBuf); err != nil {
-			logrus.Warnf("Error while writing %v to cache: %v", img, err)
+			logrus.Warnf("Error while trying to warm image: %v %v", img, err)
 			errs++
-			continue
 		}
-
-		logrus.Debugf("Wrote %s to cache", img)
 	}
 
 	if len(images) == errs {
@@ -79,22 +71,54 @@ func WarmCache(opts *config.WarmerOptions) error {
 	return nil
 }
 
-func writeBufsToFile(cachePath string, tarBuf, manifestBuf *bytes.Buffer) error {
-	f, err := os.Create(cachePath)
+// Download image in temporary files then move files to final destination
+func warmToFile(cacheDir, img string, opts *config.WarmerOptions) error {
+	f, err := os.CreateTemp(cacheDir, "warmingImage.*")
 	if err != nil {
 		return err
 	}
+	// defer called in reverse order
+	defer os.Remove(f.Name())
 	defer f.Close()
 
-	if _, err := f.Write(tarBuf.Bytes()); err != nil {
-		return errors.Wrap(err, "Failed to save tar to file")
+	mtfsFile, err := os.CreateTemp(cacheDir, "warmingManifest.*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(mtfsFile.Name())
+	defer mtfsFile.Close()
+
+	cw := &Warmer{
+		Remote:         remote.RetrieveRemoteImage,
+		Local:          LocalSource,
+		TarWriter:      f,
+		ManifestWriter: mtfsFile,
 	}
 
-	mfstPath := cachePath + ".json"
-	if err := ioutil.WriteFile(mfstPath, manifestBuf.Bytes(), 0666); err != nil {
-		return errors.Wrap(err, "Failed to save manifest to file")
+	digest, err := cw.Warm(img, opts)
+	if err != nil {
+		if IsAlreadyCached(err) {
+			logrus.Infof("Image already in cache: %v", img)
+			return nil
+		}
+		logrus.Warnf("Error while trying to warm image: %v %v", img, err)
+		return err
 	}
 
+	finalCachePath := path.Join(cacheDir, digest.String())
+	finalMfstPath := finalCachePath + ".json"
+
+	err = os.Rename(f.Name(), finalCachePath)
+	if err != nil {
+		return err
+	}
+
+	err = os.Rename(mtfsFile.Name(), finalMfstPath)
+	if err != nil {
+		return errors.Wrap(err, "Failed to rename manifest file")
+	}
+
+	logrus.Debugf("Wrote %s to cache", img)
 	return nil
 }
 
@@ -156,4 +180,42 @@ func (w *Warmer) Warm(image string, opts *config.WarmerOptions) (v1.Hash, error)
 	}
 
 	return digest, nil
+}
+
+func ParseDockerfile(opts *config.WarmerOptions) ([]string, error) {
+	var err error
+	var d []uint8
+	var baseNames []string
+	match, _ := regexp.MatchString("^https?://", opts.DockerfilePath)
+	if match {
+		response, e := http.Get(opts.DockerfilePath) //nolint:noctx
+		if e != nil {
+			return nil, e
+		}
+		d, err = io.ReadAll(response.Body)
+	} else {
+		d, err = os.ReadFile(opts.DockerfilePath)
+	}
+
+	if err != nil {
+		return nil, errors.Wrap(err, fmt.Sprintf("reading dockerfile at path %s", opts.DockerfilePath))
+	}
+
+	stages, _, err := dockerfile.Parse(d)
+	if err != nil {
+		return nil, errors.Wrap(err, "parsing dockerfile")
+	}
+
+	for i, s := range stages {
+		resolvedBaseName, err := util.ResolveEnvironmentReplacement(s.BaseName, opts.BuildArgs, false)
+		if err != nil {
+			return nil, errors.Wrap(err, fmt.Sprintf("resolving base name %s", s.BaseName))
+		}
+		if s.BaseName != resolvedBaseName {
+			stages[i].BaseName = resolvedBaseName
+		}
+		baseNames = append(baseNames, resolvedBaseName)
+	}
+	return baseNames, nil
+
 }

@@ -32,15 +32,20 @@ type CacheOptions struct {
 
 // RegistryOptions are all the options related to the registries, set by command line arguments.
 type RegistryOptions struct {
-	RegistryMirrors         multiArg
-	InsecureRegistries      multiArg
-	SkipTLSVerifyRegistries multiArg
-	RegistriesCertificates  keyValueArg
-	Insecure                bool
-	SkipTLSVerify           bool
-	InsecurePull            bool
-	SkipTLSVerifyPull       bool
-	PushRetry               int
+	RegistryMaps                 multiKeyMultiValueArg
+	RegistryMirrors              multiArg
+	InsecureRegistries           multiArg
+	SkipTLSVerifyRegistries      multiArg
+	RegistriesCertificates       keyValueArg
+	RegistriesClientCertificates keyValueArg
+	SkipDefaultRegistryFallback  bool
+	Insecure                     bool
+	SkipTLSVerify                bool
+	InsecurePull                 bool
+	SkipTLSVerifyPull            bool
+	PushIgnoreImmutableTagErrors bool
+	PushRetry                    int
+	ImageDownloadRetry           int
 }
 
 // KanikoOptions are options that are set by command line arguments
@@ -68,6 +73,8 @@ type KanikoOptions struct {
 	ImageNameDigestFile      string
 	ImageNameTagDigestFile   string
 	OCILayoutPath            string
+	Compression              Compression
+	CompressionLevel         int
 	ImageFSExtractRetry      int
 	SingleSnapshot           bool
 	Reproducible             bool
@@ -83,12 +90,14 @@ type KanikoOptions struct {
 	CacheRunLayers           bool
 	ForceBuildMetadata       bool
 	InitialFSUnpacked        bool
+	SkipPushPermissionCheck  bool
 }
 
 type KanikoGitOptions struct {
 	Branch            string
 	SingleBranch      bool
 	RecurseSubmodules bool
+	InsecureSkipTLS   bool
 }
 
 var ErrInvalidGitFlag = errors.New("invalid git flag, must be in the key=value format")
@@ -121,8 +130,41 @@ func (k *KanikoGitOptions) Set(s string) error {
 			return err
 		}
 		k.RecurseSubmodules = v
+	case "insecure-skip-tls":
+		v, err := strconv.ParseBool(parts[1])
+		if err != nil {
+			return err
+		}
+		k.InsecureSkipTLS = v
 	}
 	return nil
+}
+
+// Compression is an enumeration of the supported compression algorithms
+type Compression string
+
+// The collection of known MediaType values.
+const (
+	GZip Compression = "gzip"
+	ZStd Compression = "zstd"
+)
+
+func (c *Compression) String() string {
+	return string(*c)
+}
+
+func (c *Compression) Set(v string) error {
+	switch v {
+	case "gzip", "zstd":
+		*c = Compression(v)
+		return nil
+	default:
+		return errors.New(`must be either "gzip" or "zstd"`)
+	}
+}
+
+func (c *Compression) Type() string {
+	return "compression"
 }
 
 // WarmerOptions are options that are set by command line arguments to the cache warmer.
@@ -132,4 +174,6 @@ type WarmerOptions struct {
 	CustomPlatform string
 	Images         multiArg
 	Force          bool
+	DockerfilePath string
+	BuildArgs      multiArg
 }
