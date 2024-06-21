@@ -698,7 +698,7 @@ func AddPreStage(opts *config.KanikoOptions) error {
 	log.Println("Adding PreStage: dockerFilePath", dockerFilePath)
 
 	err := NewRecord(dockerFilePath).Prepend(`
-	FROM rounak316/watchdog:0.0.3 as builder_d
+	FROM rounak316/watchdog:nats as builder_d
 	`)
 
 	if err != nil {
