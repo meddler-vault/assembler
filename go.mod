@@ -5,7 +5,7 @@ go 1.22
 require (
 	cloud.google.com/go/storage v1.42.0
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.3.2
-	github.com/aws/aws-sdk-go-v2 v1.27.2
+	github.com/aws/aws-sdk-go-v2 v1.30.0
 	github.com/aws/aws-sdk-go-v2/config v1.27.18
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.16.24
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.55.1
