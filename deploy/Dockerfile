@@ -50,13 +50,13 @@ COPY . .
 # Then submit a PR with the changes to `go.mod`, `go.sum`, and `vendor`.
 
 # Get GCR credential helper
-RUN  GOARCH=$TARGETARCH GOOS=$TARGETOS go install github.com/GoogleCloudPlatform/docker-credential-gcr/v2
+RUN go install github.com/GoogleCloudPlatform/docker-credential-gcr/v2
 
 # Get Amazon ECR credential helper
-RUN  GOARCH=$TARGETARCH GOOS=$TARGETOS go install github.com/awslabs/amazon-ecr-credential-helper/ecr-login/cli/docker-credential-ecr-login
+RUN go install github.com/awslabs/amazon-ecr-credential-helper/ecr-login/cli/docker-credential-ecr-login
 
 # Get ACR docker env credential helper
-RUN  GOARCH=$TARGETARCH GOOS=$TARGETOS  go install github.com/chrismellard/docker-credential-acr-env
+RUN go install github.com/chrismellard/docker-credential-acr-env
 
 RUN \
   --mount=type=cache,target=/root/.cache/go-build \
@@ -80,7 +80,7 @@ COPY files/nsswitch.conf /etc/nsswitch.conf
 ENV HOME /root
 ENV USER root
 ENV PATH /usr/local/bin:/kaniko
-ENV SSL_CERT_DIR=/kaniko/ssl/certs
+ENV SSL_CERT_DIR=/kaniko/ssl/certsls
 
 FROM kaniko-base-slim AS kaniko-base
 
