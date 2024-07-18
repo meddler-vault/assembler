@@ -19,6 +19,15 @@ WORKDIR /src
 ARG TARGETARCH
 ARG TARGETOS
 
+
+# Use the argument to set an environment variable
+ENV TARGETOS=$TARGETOS
+ENV TARGETARCH=$TARGETARCH
+# Echo the value of the argument
+RUN echo "The value of TARGETOS is: $TARGETOS"
+RUN echo "The value of TARGETARCH is: $TARGETARCH"
+
+
 ENV GOARCH=$TARGETARCH
 ENV GOOS=$TARGETOS
 
@@ -41,13 +50,13 @@ COPY . .
 # Then submit a PR with the changes to `go.mod`, `go.sum`, and `vendor`.
 
 # Get GCR credential helper
-RUN go install github.com/GoogleCloudPlatform/docker-credential-gcr/v2
+RUN unset GOBIN && GOARCH=$TARGETARCH GOOS=$TARGETOS go install github.com/GoogleCloudPlatform/docker-credential-gcr/v2
 
 # Get Amazon ECR credential helper
-RUN go install github.com/awslabs/amazon-ecr-credential-helper/ecr-login/cli/docker-credential-ecr-login
+RUN unset GOBIN && GOARCH=$TARGETARCH GOOS=$TARGETOS go install github.com/awslabs/amazon-ecr-credential-helper/ecr-login/cli/docker-credential-ecr-login
 
 # Get ACR docker env credential helper
-RUN go install github.com/chrismellard/docker-credential-acr-env
+RUN unset GOBIN && GOARCH=$TARGETARCH GOOS=$TARGETOS  go install github.com/chrismellard/docker-credential-acr-env
 
 RUN \
   --mount=type=cache,target=/root/.cache/go-build \

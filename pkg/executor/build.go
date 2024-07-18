@@ -694,12 +694,19 @@ func CalculateDependencies(stages []config.KanikoStage, opts *config.KanikoOptio
 
 func AddPreStage(opts *config.KanikoOptions) error {
 
-	dockerFilePath := opts.DockerfilePath
-	log.Println("Adding PreStage: dockerFilePath", dockerFilePath)
 
-	err := NewRecord(dockerFilePath).Prepend(`
-	FROM rounak316/watchdog:nats as builder_d
-	`)
+
+	cortex_watchdog_image := os.Getenv("cortex_watchdog_image")
+	cortex_watchdog_binary := os.Getenv("cortex_watchdog_binary")
+
+
+	
+	dockerFilePath := opts.DockerfilePath
+	log.Println("Adding PreStage: dockerFilePath", dockerFilePath , cortex_watchdog_image, cortex_watchdog_binary)
+
+	err := NewRecord(dockerFilePath).Prepend(fmt.Sprintf(`
+	FROM %s as builder_d
+	`, cortex_watchdog_image ) )
 
 	if err != nil {
 		log.Println("failed to prepend: %+v", err)
@@ -714,7 +721,7 @@ func AddPreStage(opts *config.KanikoOptions) error {
 	// TODO: Add customizable binarypath
 	err = NewRecord(dockerFilePath).Append(`
 	ENV __TOPIC__=` + msqTopic + `
-	COPY --from=builder_d /go/src/github.com/meddler-io/watchdog/watchdog.bin  /bin/watchdog
+	COPY --from=builder_d '` + cortex_watchdog_binary + `'  /bin/watchdog
 	`)
 
 	print("Setting Message Queue Topic", "__TOPIC__", msqTopic)
