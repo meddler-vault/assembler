@@ -1,4 +1,4 @@
-# kaniko - Build Images In Kubernetes
+# assembler - Build Images In Kubernetes & inject watchdog to orchestrate **distributed systemd**  [based on kaniko]
 
 ## 🚨NOTE: kaniko is not an officially supported Google product🚨
 
