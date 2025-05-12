@@ -1,13 +1,6 @@
 # assembler - Build Images In Kubernetes & inject watchdog to orchestrate **distributed systemd**  [based on kaniko]
 
-## 🚨NOTE: kaniko is not an officially supported Google product🚨
 
-[![Unit tests](https://github.com/GoogleContainerTools/kaniko/actions/workflows/unit-tests.yaml/badge.svg)](https://github.com/GoogleContainerTools/kaniko/actions/workflows/unit-tests.yaml)
-[![Integration tests](https://github.com/GoogleContainerTools/kaniko/actions/workflows/integration-tests.yaml/badge.svg)](https://github.com/GoogleContainerTools/kaniko/actions/workflows/integration-tests.yaml)
-[![Build images](https://github.com/GoogleContainerTools/kaniko/actions/workflows/images.yaml/badge.svg)](https://github.com/GoogleContainerTools/kaniko/actions/workflows/images.yaml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/GoogleContainerTools/kaniko)](https://goreportcard.com/report/github.com/GoogleContainerTools/kaniko)
-
-![kaniko logo](logo/Kaniko-Logo.png)
 
 kaniko is a tool to build container images from a Dockerfile, inside a container
 or Kubernetes cluster.
