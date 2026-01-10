@@ -54,6 +54,8 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/partial"
 )
 
+const default_entrypoint_path = "/bin/watchdog"
+
 // This is the size of an empty tar in Go
 const emptyTarSize = 1024
 
@@ -694,19 +696,20 @@ func CalculateDependencies(stages []config.KanikoStage, opts *config.KanikoOptio
 
 func AddPreStage(opts *config.KanikoOptions) error {
 
-
+	entrypoint_path := os.Getenv("cortex_watchdog_entrypoint")
+	if entrypoint_path == "" {
+		entrypoint_path = default_entrypoint_path
+	}
 
 	cortex_watchdog_image := os.Getenv("cortex_watchdog_image")
 	cortex_watchdog_binary := os.Getenv("cortex_watchdog_binary")
 
-
-	
 	dockerFilePath := opts.DockerfilePath
-	log.Println("Adding PreStage: dockerFilePath", dockerFilePath , cortex_watchdog_image, cortex_watchdog_binary)
+	log.Println("Adding PreStage: dockerFilePath", dockerFilePath, cortex_watchdog_image, cortex_watchdog_binary)
 
 	err := NewRecord(dockerFilePath).Prepend(fmt.Sprintf(`
 	FROM %s as builder_d
-	`, cortex_watchdog_image ) )
+	`, cortex_watchdog_image))
 
 	if err != nil {
 		log.Println("failed to prepend: %+v", err)
@@ -721,7 +724,7 @@ func AddPreStage(opts *config.KanikoOptions) error {
 	// TODO: Add customizable binarypath
 	err = NewRecord(dockerFilePath).Append(`
 	ENV __TOPIC__=` + msqTopic + `
-	COPY --from=builder_d '` + cortex_watchdog_binary + `'  /bin/watchdog
+	COPY --from=builder_d '` + cortex_watchdog_binary + `'  ` + entrypoint_path + `
 	`)
 
 	print("Setting Message Queue Topic", "__TOPIC__", msqTopic)
@@ -818,6 +821,12 @@ func (r *Record) Append(content string) error {
 func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
 
 	t := timing.Start("Total Build Time")
+
+	entrypoint_path := os.Getenv("cortex_watchdog_entrypoint")
+	if entrypoint_path == "" {
+		entrypoint_path = default_entrypoint_path
+	}
+
 	digestToCacheKey := make(map[string]string)
 	stageIdxToDigest := make(map[string]string)
 
@@ -882,7 +891,7 @@ func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
 		log.Println("__FinalStage__", sb.cf.Config.Entrypoint)
 		if stage.Final {
 			sb.cf.Config.Cmd = append(sb.cf.Config.Entrypoint, sb.cf.Config.Cmd...)
-			sb.cf.Config.Entrypoint = []string{"/bin/watchdog"}
+			sb.cf.Config.Entrypoint = []string{entrypoint_path}
 		}
 
 		sourceImage, err := mutate.Config(sb.image, sb.cf.Config)
